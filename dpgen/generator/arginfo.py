@@ -645,8 +645,18 @@ def model_devi_args() -> list[Variant]:
 def fp_style_vasp_args() -> list[Argument]:
     doc_fp_pp_path = "Directory of psuedo-potential file to be used for 02.fp exists."
     doc_fp_pp_files = "Psuedo-potential file to be used for 02.fp. Note that the order of elements should correspond to the order in type_map."
-    doc_fp_incar = "Input file for VASP. INCAR must specify KSPACING and KGAMMA."
+    doc_fp_incar = (
+        "Input file for VASP. INCAR must specify KSPACING and KGAMMA. "
+        "This may be a string used by all FP tasks, a list indexed by system index, "
+        "or a dict keyed by system index with an optional 'default' entry."
+    )
     doc_fp_aniso_kspacing = "Set anisotropic kspacing. Usually useful for 1-D or 2-D materials. Only support VASP. If it is setting the KSPACING key in INCAR will be ignored."
+    doc_fp_kpoints = (
+        "Explicit VASP KPOINTS mesh. If set, it overrides KSPACING for matched FP tasks. "
+        "This may be a mesh list such as [2, 2, 1], or a dict keyed by system index "
+        "with optional 'default'. Dict values may be mesh lists or objects with "
+        "'style', 'mesh', and optional 'shift'."
+    )
     doc_cvasp = (
         "If cvasp is true, DP-GEN will use Custodian to help control VASP calculation."
     )
@@ -668,10 +678,11 @@ def fp_style_vasp_args() -> list[Argument]:
     return [
         Argument("fp_pp_path", str, optional=False, doc=doc_fp_pp_path),
         Argument("fp_pp_files", list[str], optional=False, doc=doc_fp_pp_files),
-        Argument("fp_incar", str, optional=False, doc=doc_fp_incar),
+        Argument("fp_incar", [str, list[str], dict], optional=False, doc=doc_fp_incar),
         Argument(
             "fp_aniso_kspacing", list[float], optional=True, doc=doc_fp_aniso_kspacing
         ),
+        Argument("fp_kpoints", [list[int], dict], optional=True, doc=doc_fp_kpoints),
         Argument("cvasp", bool, optional=True, doc=doc_cvasp),
         Argument("fp_skip_bad_box", str, optional=True, doc=doc_fp_skip_bad_box),
     ]

@@ -1,0 +1,74 @@
+{
+  "api_version": "1.0",
+  "deepmd_version": "2.2.0",
+  "train": {
+    "command": "dp",
+    "machine": {
+      "batch_type": "Slurm",
+      "context_type": "LocalContext",
+      "local_root": "./"
+    },
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 0,
+      "gpu_per_node": 0,
+      "queue_name": "GPU_QUEUE",
+      "custom_flags": [
+        "#SBATCH --gres=gpu:1",
+        "#SBATCH --time=24:00:00"
+      ],
+      "group_size": 1,
+      "source_list": [
+        "source /path/to/deepmd/env/activate"
+      ]
+    }
+  },
+  "model_devi": {
+    "command": "lmp -i input.lammps -v restart 0",
+    "machine": {
+      "batch_type": "Slurm",
+      "context_type": "LocalContext",
+      "local_root": "./"
+    },
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 16,
+      "gpu_per_node": 0,
+      "queue_name": "CPU_QUEUE",
+      "custom_flags": [
+        "#SBATCH --time=04:00:00"
+      ],
+      "group_size": 10,
+      "source_list": [
+        "source /path/to/lammps/env/activate"
+      ]
+    }
+  },
+  "fp": {
+    "command": "mpirun -np 32 vasp_std",
+    "machine": {
+      "batch_type": "Slurm",
+      "context_type": "SSHContext",
+      "local_root": "./",
+      "remote_root": "/scratch/YOUR_USER/dp-cu-cuo-fp",
+      "remote_profile": {
+        "hostname": "fp.cluster.example.edu",
+        "username": "YOUR_USER",
+        "port": 22
+      }
+    },
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 32,
+      "gpu_per_node": 0,
+      "queue_name": "VASP_QUEUE",
+      "custom_flags": [
+        "#SBATCH --time=24:00:00"
+      ],
+      "group_size": 1,
+      "source_list": [
+        "source /path/to/vasp/env/activate"
+      ]
+    }
+  }
+}

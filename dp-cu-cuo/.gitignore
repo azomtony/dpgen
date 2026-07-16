@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+
+# Local generated data and run state
+initial_data/
+generated/
+pseudopotentials/
+iter.*/
+record.dpgen
+dpgen.log
+machine.train.json
+machine.json
+
+# VASP / scheduler outputs
+WAVECAR
+CHGCAR
+OUTCAR
+vasprun.xml
+slurm-*.out
+*.log

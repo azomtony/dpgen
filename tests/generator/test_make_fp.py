@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 
 import dpdata
@@ -13,6 +14,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 __package__ = "generator"
 import scipy.constants as pc
 from pymatgen.io.vasp import Incar, Kpoints
+
+from dpgen.generator.run import (
+    _format_explicit_kpoints,
+    _select_fp_kpoints,
+    _select_vasp_incar_path,
+    make_vasp_incar,
+)
 
 from .comp_sys import test_atom_names
 from .context import (
@@ -993,6 +1001,78 @@ class TestMakeFPSIESTA(unittest.TestCase):
 
 
 class TestMakeFPVasp(unittest.TestCase):
+    def test_select_vasp_incar_by_system_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            incar_0 = os.path.join(tmpdir, "INCAR.0")
+            incar_1 = os.path.join(tmpdir, "INCAR.1")
+            incar_default = os.path.join(tmpdir, "INCAR.default")
+            with open(incar_0, "w") as fp:
+                fp.write("SYSTEM = zero\nKSPACING = 0.2\nKGAMMA = T\n")
+            with open(incar_1, "w") as fp:
+                fp.write("SYSTEM = one\nKSPACING = 0.3\nKGAMMA = T\n")
+            with open(incar_default, "w") as fp:
+                fp.write("SYSTEM = default\nKSPACING = 0.4\nKGAMMA = T\n")
+
+            jdata = {
+                "fp_incar": {
+                    "0": incar_0,
+                    "1": incar_1,
+                    "default": incar_default,
+                }
+            }
+            self.assertEqual(
+                _select_vasp_incar_path(jdata, "iter.000000/02.fp/task.001.000123"),
+                incar_1,
+            )
+            self.assertEqual(
+                _select_vasp_incar_path(jdata, "iter.000000/02.fp/task.099.000123"),
+                incar_default,
+            )
+
+            output = os.path.join(tmpdir, "INCAR")
+            make_vasp_incar(jdata, output, task_path="task.001.000000")
+            with open(output) as fp:
+                self.assertIn("SYSTEM = one", fp.read())
+
+    def test_format_explicit_monkhorst_pack_kpoints(self):
+        kpoints = _format_explicit_kpoints(
+            {
+                "style": "Monkhorst-Pack",
+                "mesh": [2, 1, 2],
+                "shift": [0, 0, 0],
+            }
+        )
+        self.assertEqual(
+            kpoints,
+            "Automatic mesh\n0\nMonkhorst-Pack\n2 1 2\n0 0 0\n",
+        )
+
+    def test_select_fp_kpoints_by_system_index(self):
+        jdata = {
+            "fp_kpoints": {
+                "0": [2, 2, 1],
+                "1": {
+                    "style": "Monkhorst-Pack",
+                    "mesh": [2, 1, 2],
+                    "shift": [0.5, 0, 0],
+                },
+            }
+        }
+        self.assertEqual(
+            _select_fp_kpoints(jdata, "iter.000000/02.fp/task.000.000123"),
+            [2, 2, 1],
+        )
+        kpoints = _format_explicit_kpoints(
+            _select_fp_kpoints(jdata, "iter.000000/02.fp/task.001.000123")
+        )
+        self.assertEqual(
+            kpoints,
+            "Automatic mesh\n0\nMonkhorst-Pack\n2 1 2\n0.5 0 0\n",
+        )
+        self.assertIsNone(
+            _select_fp_kpoints(jdata, "iter.000000/02.fp/task.002.000123")
+        )
+
     def test_make_fp_vasp(self):
         setUpModule()
         if os.path.isdir("iter.000000"):

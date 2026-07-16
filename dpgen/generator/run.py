@@ -3121,9 +3121,107 @@ def _make_fp_vasp_inner(
     return fp_tasks
 
 
-def make_vasp_incar(jdata, filename):
+def _abspath_fp_incar(fp_incar):
+    if isinstance(fp_incar, str):
+        return os.path.abspath(fp_incar)
+    if isinstance(fp_incar, list):
+        return [os.path.abspath(ii) for ii in fp_incar]
+    if isinstance(fp_incar, dict):
+        return {str(key): os.path.abspath(value) for key, value in fp_incar.items()}
+    raise TypeError("fp_incar should be a string, list, or dict")
+
+
+def _get_fp_task_sys_idx(task_path):
+    if task_path is None:
+        task_path = os.getcwd()
+    task_name = os.path.basename(os.path.abspath(task_path))
+    task_parts = task_name.split(".")
+    if len(task_parts) >= 3 and task_parts[0] == "task":
+        return int(task_parts[1])
+    return None
+
+
+def _select_vasp_incar_path(jdata, task_path=None):
+    fp_incar = jdata["fp_incar"]
+    if isinstance(fp_incar, str):
+        return fp_incar
+
+    sys_idx = _get_fp_task_sys_idx(task_path)
+    if isinstance(fp_incar, list):
+        if sys_idx is None:
+            raise RuntimeError("Cannot select fp_incar list entry outside a task path")
+        if sys_idx >= len(fp_incar):
+            raise RuntimeError(
+                f"Cannot select fp_incar for system index {sys_idx}: only {len(fp_incar)} entries provided"
+            )
+        return fp_incar[sys_idx]
+
+    if isinstance(fp_incar, dict):
+        if sys_idx is not None and str(sys_idx) in fp_incar:
+            return fp_incar[str(sys_idx)]
+        if "default" in fp_incar:
+            return fp_incar["default"]
+        raise RuntimeError(
+            f"Cannot select fp_incar for system index {sys_idx}: provide key '{sys_idx}' or 'default'"
+        )
+
+    raise TypeError("fp_incar should be a string, list, or dict")
+
+
+def _select_fp_kpoints(jdata, task_path=None):
+    fp_kpoints = jdata.get("fp_kpoints")
+    if fp_kpoints is None:
+        return None
+
+    if isinstance(fp_kpoints, list):
+        return fp_kpoints
+
+    if isinstance(fp_kpoints, dict):
+        sys_idx = _get_fp_task_sys_idx(task_path)
+        if sys_idx is not None and str(sys_idx) in fp_kpoints:
+            return fp_kpoints[str(sys_idx)]
+        return fp_kpoints.get("default")
+
+    raise TypeError("fp_kpoints should be a list or dict")
+
+
+def _format_explicit_kpoints(kpoints):
+    if kpoints is None:
+        return None
+
+    if isinstance(kpoints, list):
+        style = "Monkhorst-Pack"
+        mesh = kpoints
+        shift = [0, 0, 0]
+    elif isinstance(kpoints, dict):
+        style = kpoints.get("style", "Monkhorst-Pack")
+        mesh = kpoints["mesh"]
+        shift = kpoints.get("shift", [0, 0, 0])
+    else:
+        raise TypeError("fp_kpoints entry should be a mesh list or dict")
+
+    if len(mesh) != 3 or len(shift) != 3:
+        raise ValueError("fp_kpoints mesh and shift should contain three values")
+    mesh = [int(ii) for ii in mesh]
+    shift = [float(ii) for ii in shift]
+    if any(ii < 1 for ii in mesh):
+        raise ValueError("fp_kpoints mesh values should be positive integers")
+
+    return "\n".join(
+        [
+            "Automatic mesh",
+            "0",
+            style,
+            "{} {} {}".format(*mesh),
+            "{:g} {:g} {:g}".format(*shift),
+            "",
+        ]
+    )
+
+
+def make_vasp_incar(jdata, filename, task_path=None):
     if "fp_incar" in jdata.keys():
-        fp_incar_path = jdata["fp_incar"]
+        fp_incar_path = _select_vasp_incar_path(jdata, task_path=task_path)
         assert os.path.exists(fp_incar_path)
         fp_incar_path = os.path.abspath(fp_incar_path)
         fr = open(fp_incar_path)
@@ -3241,7 +3339,7 @@ def make_fp_vasp_incar(iter_index, jdata, nbands_esti=None):
     cwd = os.getcwd()
     for ii in fp_tasks:
         os.chdir(ii)
-        make_vasp_incar(jdata, "INCAR")
+        make_vasp_incar(jdata, "INCAR", task_path=ii)
         if os.path.exists("job.json"):
             with open("job.json") as fp:
                 job_data = json.load(fp)
@@ -3301,6 +3399,15 @@ def make_fp_vasp_kp(iter_index, jdata):
     cwd = os.getcwd()
     for ii in fp_tasks:
         os.chdir(ii)
+        explicit_kpoints = _format_explicit_kpoints(
+            _select_fp_kpoints(jdata, task_path=ii)
+        )
+        if explicit_kpoints is not None:
+            with open("KPOINTS", "w") as fp:
+                fp.write(explicit_kpoints)
+            os.chdir(cwd)
+            continue
+
         # get kspacing and kgamma from incar
         assert os.path.exists("INCAR")
         with open("INCAR") as fp:
@@ -3547,7 +3654,7 @@ def _make_fp_vasp_configs(iter_index: int, jdata: dict):
 def make_fp_vasp(iter_index, jdata):
     # abs path for fp_incar if it exists
     if "fp_incar" in jdata:
-        jdata["fp_incar"] = os.path.abspath(jdata["fp_incar"])
+        jdata["fp_incar"] = _abspath_fp_incar(jdata["fp_incar"])
     # get nbands esti if it exists
     if "fp_nbands_esti_data" in jdata:
         nbe = NBandsEsti(jdata["fp_nbands_esti_data"])
