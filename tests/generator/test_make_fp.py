@@ -479,6 +479,15 @@ def _check_kpoints(testCase, idx):
         testCase.assertEqual(repr(kpoints), repr(kpoints_ref))
 
 
+def _count_fp_tasks_by_system(idx):
+    fp_path = os.path.join("iter.%06d" % idx, "02.fp")  # noqa: UP031
+    counts = {}
+    for task in glob.glob(os.path.join(fp_path, "task.*")):
+        sys_idx = os.path.basename(task).split(".")[1]
+        counts[sys_idx] = counts.get(sys_idx, 0) + 1
+    return counts
+
+
 def _check_incar_exists(testCase, idx):
     fp_path = os.path.join("iter.%06d" % idx, "02.fp")  # noqa: UP031
     # testCase.assertTrue(os.path.isfile(os.path.join(fp_path, 'INCAR')))
@@ -1108,6 +1117,30 @@ class TestMakeFPVasp(unittest.TestCase):
         _check_kpoints(self, 0)
         # checked elsewhere
         # _check_potcar(self, 0, jdata['fp_pp_path'], jdata['fp_pp_files'])
+        shutil.rmtree("iter.000000")
+
+    def test_make_fp_vasp_system_wise_task_max(self):
+        setUpModule()
+        if os.path.isdir("iter.000000"):
+            shutil.rmtree("iter.000000")
+        with open(param_file) as fp:
+            jdata = json.load(fp)
+        md_descript = []
+        nsys = 2
+        nmd = 3
+        for ii in range(nsys):
+            tmp = []
+            for jj in range(nmd):
+                tmp.append(np.arange(0, 0.29, 0.29 / 10))
+            md_descript.append(tmp)
+        atom_types = [0, 1, 0, 1]
+        type_map = jdata["type_map"]
+        _make_fake_md(0, md_descript, atom_types, type_map)
+
+        jdata["fp_task_max"] = {"default": 3, "1": 6}
+        make_fp(0, jdata, {})
+
+        self.assertEqual(_count_fp_tasks_by_system(0), {"000": 3, "001": 6})
         shutil.rmtree("iter.000000")
 
     def test_make_fp_vasp_merge_traj(self):

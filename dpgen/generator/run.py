@@ -163,6 +163,32 @@ def make_fp_task_name(sys_idx, counter):
     return "task." + fp_task_fmt % (sys_idx, counter)
 
 
+def _get_sys_wise_value(value, sys_idx, key_name="value"):
+    """Return a scalar or system-specific value.
+
+    System-specific values may be lists indexed by system index, or dicts keyed
+    by system index with an optional ``default`` entry.
+    """
+    if isinstance(value, list):
+        return value[sys_idx]
+    if isinstance(value, dict):
+        for key in (sys_idx, str(sys_idx), f"{sys_idx:03d}"):
+            if key in value:
+                return value[key]
+        if "default" in value:
+            return value["default"]
+        raise KeyError(f"{key_name} does not define system {sys_idx} or default")
+    return value
+
+
+def _get_sys_wise_int(value, sys_idx, key_name):
+    return int(_get_sys_wise_value(value, sys_idx, key_name))
+
+
+def _get_ratio_failed(jdata, default):
+    return jdata.get("ratio_failed", jdata.get("failed_ratio", default))
+
+
 def get_sys_index(task):
     task.sort()
     system_index = []
@@ -185,7 +211,9 @@ def _check_empty_iter(iter_index, max_v=0):
         for single_sys in sys_paths:
             sys = dpdata.LabeledSystem(os.path.join(single_sys), fmt="deepmd/npy")
             nframe += len(sys)
-        empty_sys.append(nframe < max_v)
+        sys_idx = int(os.path.basename(ii).split(".")[-1])
+        max_v_sys = _get_sys_wise_int(max_v, sys_idx, "fp_task_min")
+        empty_sys.append(nframe < max_v_sys)
     return all(empty_sys)
 
 
@@ -430,9 +458,13 @@ def make_train_dp(iter_index, jdata, mdata):
                         number_new_frames += nframes
                     else:
                         number_old_frames += nframes
-                if nframes < fp_task_min:
+                fp_task_min_sys = _get_sys_wise_int(
+                    fp_task_min, sys_idx, "fp_task_min"
+                )
+                if nframes < fp_task_min_sys:
                     log_task(
-                        "nframes (%d) in data sys %s is too small, skip" % (nframes, jj)  # noqa: UP031
+                        "nframes (%d) in data sys %s is smaller than fp_task_min (%d), skip"
+                        % (nframes, jj, fp_task_min_sys)  # noqa: UP031
                     )
                     continue
                 for sys_single in sys_paths:
@@ -2882,18 +2914,21 @@ def _make_fp_vasp_inner(
 
         # set number of tasks
         accurate_ratio = float(counter["accurate"]) / float(fp_sum)
+        ss_idx = int(ss)
+        fp_task_min_sys = _get_sys_wise_int(fp_task_min, ss_idx, "fp_task_min")
+        fp_task_max_sys = _get_sys_wise_int(fp_task_max, ss_idx, "fp_task_max")
         fp_accurate_threshold = jdata.get("fp_accurate_threshold", 1)
         fp_accurate_soft_threshold = jdata.get(
             "fp_accurate_soft_threshold", fp_accurate_threshold
         )
         if accurate_ratio < fp_accurate_soft_threshold:
-            this_fp_task_max = fp_task_max
+            this_fp_task_max = fp_task_max_sys
         elif (
             accurate_ratio >= fp_accurate_soft_threshold
             and accurate_ratio < fp_accurate_threshold
         ):
             this_fp_task_max = int(
-                fp_task_max
+                fp_task_max_sys
                 * (accurate_ratio - fp_accurate_threshold)
                 / (fp_accurate_soft_threshold - fp_accurate_threshold)
             )
@@ -2910,7 +2945,7 @@ def _make_fp_vasp_inner(
                 calypso_intend_fp_num = int(calypso_intend_fp_num_temp)
         # ----------------------------------------------------------------------------
         numb_task = min(this_fp_task_max, len(fp_candidate))
-        if numb_task < fp_task_min:
+        if numb_task < fp_task_min_sys:
             numb_task = 0
 
         # ----------------------------------------------------------------------------
@@ -2920,7 +2955,7 @@ def _make_fp_vasp_inner(
             and candi_num <= calypso_total_fp_num
         ):
             numb_task = min(this_fp_task_max, len(fp_candidate))
-            if numb_task < fp_task_min:
+            if numb_task < fp_task_min_sys:
                 numb_task = 0
         elif (
             model_devi_engine == "calypso"
@@ -2932,7 +2967,7 @@ def _make_fp_vasp_inner(
                 numb_task = 0
         # ----------------------------------------------------------------------------
         dlog.info(
-            f"system {ss:s} accurate_ratio: {accurate_ratio:8.4f}    thresholds: {fp_accurate_soft_threshold:6.4f} and {fp_accurate_threshold:6.4f}   eff. task min and max {fp_task_min:4d} {this_fp_task_max:4d}   number of fp tasks: {numb_task:6d}"
+            f"system {ss:s} accurate_ratio: {accurate_ratio:8.4f}    thresholds: {fp_accurate_soft_threshold:6.4f} and {fp_accurate_threshold:6.4f}   eff. task min and max {fp_task_min_sys:4d} {this_fp_task_max:4d}   number of fp tasks: {numb_task:6d}"
         )
         # make fp tasks
 
@@ -4488,7 +4523,7 @@ def run_fp(iter_index, jdata, mdata):
 
 
 def post_fp_check_fail(iter_index, jdata, rfailed=None):
-    ratio_failed = rfailed if rfailed else jdata.get("ratio_failed", 0.05)
+    ratio_failed = rfailed if rfailed else _get_ratio_failed(jdata, 0.05)
     iter_name = make_iter_name(iter_index)
     work_path = os.path.join(iter_name, fp_name)
     fp_tasks = glob.glob(os.path.join(work_path, "task.*"))
@@ -4516,7 +4551,7 @@ def post_fp_check_fail(iter_index, jdata, rfailed=None):
 
 
 def post_fp_vasp(iter_index, jdata, rfailed=None):
-    ratio_failed = rfailed if rfailed else jdata.get("ratio_failed", 0.05)
+    ratio_failed = rfailed if rfailed else _get_ratio_failed(jdata, 0.05)
     model_devi_engine = jdata.get("model_devi_engine", "lammps")
     if model_devi_engine != "calypso":
         model_devi_jobs = jdata["model_devi_jobs"]
@@ -4789,7 +4824,7 @@ def post_fp_gaussian(iter_index, jdata):
 
 
 def post_fp_cp2k(iter_index, jdata, rfailed=None):
-    ratio_failed = rfailed if rfailed else jdata.get("ratio_failed", 0.10)
+    ratio_failed = rfailed if rfailed else _get_ratio_failed(jdata, 0.10)
     model_devi_jobs = jdata["model_devi_jobs"]
     assert iter_index < len(model_devi_jobs)
 
@@ -4848,7 +4883,7 @@ def post_fp_cp2k(iter_index, jdata, rfailed=None):
 
 
 def post_fp_pwmat(iter_index, jdata, rfailed=None):
-    ratio_failed = rfailed if rfailed else jdata.get("ratio_failed", 0.05)
+    ratio_failed = rfailed if rfailed else _get_ratio_failed(jdata, 0.05)
     model_devi_jobs = jdata["model_devi_jobs"]
     assert iter_index < len(model_devi_jobs)
 

@@ -1044,10 +1044,31 @@ def fp_args() -> list[Argument]:
         "If set to true, a detailed report will be generated for each iteration."
     )
     doc_ratio_failed = "Check the ratio of unsuccessfully terminated jobs. If too many FP tasks are not converged, RuntimeError will be raised."
+    doc_failed_ratio = "Alias of ratio_failed."
+    doc_fp_task_max = (
+        doc_fp_task_max
+        + " This may be an integer used by all systems, a list indexed by system "
+        "index, or a dict keyed by system index with an optional 'default' entry."
+    )
+    doc_fp_task_min = (
+        doc_fp_task_min
+        + " This may be an integer used by all systems, a list indexed by system "
+        "index, or a dict keyed by system index with an optional 'default' entry."
+    )
 
     return [
-        Argument("fp_task_max", int, optional=False, doc=doc_fp_task_max),
-        Argument("fp_task_min", int, optional=False, doc=doc_fp_task_min),
+        Argument(
+            "fp_task_max",
+            [int, list[int], dict],
+            optional=False,
+            doc=doc_fp_task_max,
+        ),
+        Argument(
+            "fp_task_min",
+            [int, list[int], dict],
+            optional=False,
+            doc=doc_fp_task_min,
+        ),
         Argument(
             "fp_accurate_threshold", float, optional=True, doc=doc_fp_accurate_threshold
         ),
@@ -1066,6 +1087,7 @@ def fp_args() -> list[Argument]:
             doc=doc_detailed_report_make_fp,
         ),
         Argument("ratio_failed", float, optional=True, doc=doc_ratio_failed),
+        Argument("failed_ratio", float, optional=True, doc=doc_failed_ratio),
     ]
 
 
