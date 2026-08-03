@@ -12,5 +12,6 @@ class TestCLI(unittest.TestCase):
             "init_bulk",
             "init_reaction",
             "autotest",
+            "test-model",
         ):
             sp.check_output(["dpgen", subcommand, "-h"])

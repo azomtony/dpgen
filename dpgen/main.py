@@ -17,6 +17,7 @@ from dpgen.gui import start_dpgui
 from dpgen.simplify.simplify import gen_simplify
 from dpgen.tools.auto_gen_param import auto_gen_param
 from dpgen.tools.run_report import run_report
+from dpgen.tools.test_model import add_parser as add_test_model_parser
 
 """
 A master convenience script with many tools for driving dpgen.
@@ -175,6 +176,9 @@ def main_parser() -> argparse.ArgumentParser:
         "-s", "--shuffle", action="store_true", help="shuffle the data systems"
     )
     parser_coll.set_defaults(func=gen_collect)
+
+    # test model
+    add_test_model_parser(subparsers)
 
     # simplify
     parser_run = subparsers.add_parser("simplify", help="Simplify data.")
