@@ -31,6 +31,7 @@ class TestModelTest(unittest.TestCase):
             model_dir = work_path / "models"
             output_dir = work_path / "out"
             fake_bin = work_path / "dp"
+            fake_backend_bin = work_path / "fake-dp-pt"
 
             (systems_dir / "sys.000" / "Cu108O0").mkdir(parents=True)
             (systems_dir / "sys.001").mkdir(parents=True)
@@ -45,6 +46,14 @@ class TestModelTest(unittest.TestCase):
                 "echo 'Force  RMSE        : 3.0e-02 eV/A'\n"
             )
             fake_bin.chmod(fake_bin.stat().st_mode | stat.S_IXUSR)
+            fake_backend_bin.write_text(
+                "#!/bin/sh\n"
+                "test \"$1\" = \"--pt\" || exit 2\n"
+                "echo '# number of test data : 7'\n"
+                "echo 'Energy RMSE/Natoms : 2.0e-03 eV'\n"
+                "echo 'Force  RMSE        : 3.0e-02 eV/A'\n"
+            )
+            fake_backend_bin.chmod(fake_backend_bin.stat().st_mode | stat.S_IXUSR)
 
             rows = run_model_tests(
                 systems_dir,
@@ -61,13 +70,20 @@ class TestModelTest(unittest.TestCase):
             self.assertIn("2", summary)
             self.assertIn("30", summary)
 
+            run_model_tests(
+                systems_dir,
+                model_dir,
+                work_path / "out_pt",
+                dp_command=f"{fake_backend_bin} --pt",
+            )
+
     def test_submit_model_tests_uses_dispatcher_layout(self):
         with tempfile.TemporaryDirectory() as work_dir:
             work_path = Path(work_dir)
             output_dir = work_path / "out"
             machine_file = work_path / "machine.json"
             system = work_path / "sys.000"
-            model = work_path / "graph.000.pb"
+            model = work_path / "graph.000.pth"
             system.mkdir()
             (system / "type.raw").write_text("0\n")
             model.write_text("model")
@@ -76,7 +92,7 @@ class TestModelTest(unittest.TestCase):
                 {
                   "api_version": "1.0",
                   "train": {
-                    "command": "dp",
+                    "command": "dp --pt",
                     "machine": {"local_root": "./"},
                     "resources": {"group_size": 4}
                   }
@@ -100,16 +116,16 @@ class TestModelTest(unittest.TestCase):
                 submit_model_tests([case], output_dir, machine_file, "train")
 
             self.assertTrue((output_dir / "sys.000" / "system").is_symlink())
-            self.assertTrue((output_dir / "sys.000" / "model.pb").is_symlink())
+            self.assertTrue((output_dir / "sys.000" / "model.pth").is_symlink())
             make_submission.assert_called_once()
             kwargs = make_submission.call_args.kwargs
             self.assertEqual(
                 kwargs["commands"],
-                ["( cd sys.000 && dp test -m model.pb -s system -n 0 -d detail > dp_test.log 2>&1 )"],
+                ["( cd sys.000 && dp --pt test -m model.pth -s system -n 0 -d detail > dp_test.log 2>&1 )"],
             )
             self.assertEqual(kwargs["run_tasks"], ["."])
             self.assertEqual(kwargs["group_size"], 4)
-            self.assertEqual(kwargs["forward_files"], ["sys.000/model.pb", "sys.000/system"])
+            self.assertEqual(kwargs["forward_files"], ["sys.000/model.pth", "sys.000/system"])
             fake_submission.run_submission.assert_called_once()
 
 

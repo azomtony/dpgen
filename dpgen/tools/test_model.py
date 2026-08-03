@@ -10,6 +10,12 @@ from pathlib import Path
 
 
 FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+DEFAULT_MODEL_PATTERNS = [
+    "graph*.pb",
+    "graph*.pth",
+    "frozen_model*.pb",
+    "frozen_model*.pth",
+]
 DETAIL_BACKWARD_FILES = [
     "dp_test.log",
     "detail.e.out",
@@ -84,23 +90,25 @@ def discover_systems(systems_dir, system_prefixes=None):
     raise RuntimeError(f"{systems_dir} does not contain any DeepMD systems.")
 
 
-def discover_models(model_path, model_pattern):
+def discover_models(model_path, model_pattern=None):
     model_path = Path(model_path).resolve()
     if model_path.is_file():
         return [model_path]
     if not model_path.is_dir():
         raise FileNotFoundError(f"{model_path} does not exist.")
 
-    models = sorted(
-        Path(ii).resolve() for ii in glob.glob(str(model_path / model_pattern))
-    )
-    if not models and model_pattern == "graph*.pb":
+    patterns = DEFAULT_MODEL_PATTERNS if model_pattern is None else [model_pattern]
+    models = []
+    for pattern in patterns:
         models = sorted(
-            Path(ii).resolve()
-            for ii in glob.glob(str(model_path / "frozen_model*.pb"))
+            Path(ii).resolve() for ii in glob.glob(str(model_path / pattern))
         )
+        if models:
+            break
     if not models:
-        raise RuntimeError(f"No models matching {model_pattern!r} found in {model_path}.")
+        raise RuntimeError(
+            f"No models matching {', '.join(patterns)!r} found in {model_path}."
+        )
     return models
 
 
@@ -311,7 +319,7 @@ def run_model_tests(
     model_path,
     output_dir,
     dp_command=None,
-    model_pattern="graph*.pb",
+    model_pattern=None,
     numb_test=0,
     param_file=None,
     keep_going=False,
@@ -343,7 +351,7 @@ def run_model_tests(
         )
         return write_summary_from_logs(output_dir)
 
-    command_prefix = shlex.split(dp_command or "dp")
+    command_prefix = shlex.split(dp_command or "dp --pt")
     for case in cases:
         run_dir = case["run_dir"]
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -408,8 +416,7 @@ def submit_model_tests(
         machine_file, task_type
     )
     _check_api_version(mdata)
-    if dp_command is not None:
-        command = dp_command
+    command = dp_command or command or "dp --pt"
 
     output_dir = Path(output_dir).resolve()
     extra_dp_args = extra_dp_args or []
@@ -517,7 +524,7 @@ def add_parser(subparsers):
     parser.add_argument(
         "--model-pattern",
         type=str,
-        default="graph*.pb",
+        default=None,
         help="glob pattern used when MODEL is a directory",
     )
     parser.add_argument(
@@ -531,7 +538,7 @@ def add_parser(subparsers):
         "--dp-command",
         type=str,
         default=None,
-        help="DeePMD-kit command to run; defaults to dp locally or machine task command when submitted",
+        help="DeePMD-kit command to run; defaults to 'dp --pt' locally or the machine task command when submitted",
     )
     parser.add_argument(
         "--keep-going",
@@ -574,7 +581,7 @@ def _main():
     parser.add_argument("MODEL", type=str, help="model file or directory of models")
     parser.add_argument("OUTPUT", type=str, help="directory for test outputs")
     parser.add_argument("-p", "--param", type=str, default=None)
-    parser.add_argument("--model-pattern", type=str, default="graph*.pb")
+    parser.add_argument("--model-pattern", type=str, default=None)
     parser.add_argument("-n", "--numb-test", type=int, default=0)
     parser.add_argument("--dp-command", type=str, default=None)
     parser.add_argument("--keep-going", action="store_true")
