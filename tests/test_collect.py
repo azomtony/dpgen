@@ -35,3 +35,27 @@ class TestCollectData(unittest.TestCase):
             collect_data(inpdir, param_file.name, outdir, verbose=True)
             ms = dpdata.MultiSystems().from_deepmd_npy(outdir)
             self.assertEqual(ms.get_nframes(), self.data.get_nframes() * 3)
+
+    def test_collect_data_by_original_system_with_formula_subdirs(self):
+        with (
+            tempfile.TemporaryDirectory() as inpdir,
+            tempfile.TemporaryDirectory() as outdir,
+            tempfile.NamedTemporaryFile() as param_file,
+        ):
+            self.data.to_deepmd_npy(
+                Path(inpdir) / "iter.000000" / "02.fp" / "data.000" / "Cu108O0"
+            )
+            self.data.to_deepmd_npy(
+                Path(inpdir) / "iter.000001" / "02.fp" / "data.000" / "Cu108O0"
+            )
+            with open(param_file.name, "w") as fp:
+                json.dump(
+                    {"sys_configs": ["cu-bulk/Cu108"], "model_devi_jobs": [{}, {}]},
+                    fp,
+                )
+
+            collect_data(
+                inpdir, param_file.name, outdir, verbose=True, merge=False
+            )
+            ms = dpdata.MultiSystems().from_deepmd_npy(Path(outdir) / "sys.000")
+            self.assertEqual(ms.get_nframes(), self.data.get_nframes() * 2)

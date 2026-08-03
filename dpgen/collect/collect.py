@@ -46,19 +46,23 @@ def collect_data(
     iters = ["iter.%06d" % ii for ii in range(numb_jobs)]  # noqa: UP031
     # loop over iters to collect data
     for ii in range(len(iters)):
-        iter_data = glob.glob(os.path.join(iters[ii], "02.fp", "data.[0-9]*[0-9]"))
-        iter_data.sort()
-        iter_data = sum([expand_sys_str(ii) for ii in iter_data], [])
-        for jj in iter_data:
-            sys = dpdata.LabeledSystem(jj, fmt="deepmd/npy")
-            if merge:
-                sys_str = sys.formula
-            else:
-                sys_str = os.path.basename(jj).split(".")[-1]
-            if sys_str in coll_data.keys():
-                coll_data[sys_str].append(sys)
-            else:
-                coll_data[sys_str] = sys
+        iter_data_roots = glob.glob(
+            os.path.join(iters[ii], "02.fp", "data.[0-9]*[0-9]")
+        )
+        iter_data_roots.sort()
+        for data_root in iter_data_roots:
+            data_sys_idx = os.path.basename(data_root).split(".")[-1]
+            iter_data = expand_sys_str(data_root)
+            for jj in iter_data:
+                sys = dpdata.LabeledSystem(jj, fmt="deepmd/npy")
+                if merge:
+                    sys_str = sys.formula
+                else:
+                    sys_str = data_sys_idx
+                if sys_str in coll_data.keys():
+                    coll_data[sys_str].append(sys)
+                else:
+                    coll_data[sys_str] = sys
     # print information
     if verbose:
         for ii in range(len(init_data)):
