@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 
-from dpgen.generator.finetune import prepare_finetune_jdata
+from dpgen.generator.finetune import _get_finetune_args, prepare_finetune_jdata
 
 
 class TestFinetune(unittest.TestCase):
@@ -66,6 +66,24 @@ class TestFinetune(unittest.TestCase):
         self.assertEqual(
             prepared["finetune_args"], "--model-branch base --use-pretrain-script"
         )
+
+    def test_finetune_model_branch_is_only_used_for_finetune(self):
+        with tempfile.NamedTemporaryFile(suffix=".pth") as model:
+            jdata = {
+                "numb_models": 1,
+                "finetune_model": model.name,
+                "finetune_model_branch": "Omat24",
+                "default_training_param": {
+                    "model": {
+                        "descriptor": {},
+                    }
+                },
+            }
+
+            prepared = prepare_finetune_jdata(jdata)
+
+        self.assertIn("--model-branch Omat24", _get_finetune_args(prepared, True))
+        self.assertNotIn("--model-branch Omat24", _get_finetune_args(prepared, False))
 
     def test_prepare_finetune_jdata_rejects_non_pytorch_backend(self):
         with tempfile.NamedTemporaryFile(suffix=".pb") as model:

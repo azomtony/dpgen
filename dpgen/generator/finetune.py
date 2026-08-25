@@ -68,6 +68,12 @@ def prepare_finetune_jdata(jdata):
         )
     jdata["finetune_model_source"] = model_source
 
+    model_branch = jdata.get("finetune_model_branch")
+    if model_branch is not None:
+        if not isinstance(model_branch, str) or not model_branch:
+            raise RuntimeError("finetune_model_branch should be a non-empty string.")
+        jdata["finetune_model_branch"] = model_branch
+
     numb_models = jdata.get("numb_models")
     if numb_models is not None and len(models) != numb_models:
         raise RuntimeError(
@@ -101,6 +107,13 @@ def prepare_finetune_jdata(jdata):
 def _uses_pretrain_script(jdata):
     model = jdata.get("default_training_param", {}).get("model", {})
     return model.get("descriptor") == {} or model.get("fitting_net") == {}
+
+
+def _get_finetune_args(jdata, include_model_branch):
+    args = jdata.get("finetune_args", "")
+    if include_model_branch and jdata.get("finetune_model_branch"):
+        args = f"{args} --model-branch {jdata['finetune_model_branch']}".strip()
+    return args
 
 
 def _make_train_finetune(iter_index, jdata, mdata):
@@ -178,7 +191,7 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
 
     train_command = mdata.get("train_command", "dp").strip()
     train_command += " --pt"
-    finetune_args = jdata.get("finetune_args", "")
+    finetune_args = _get_finetune_args(jdata, init_from_foundation)
 
     iter_name = make_iter_name(iter_index)
     work_path = os.path.join(iter_name, train_name)
@@ -311,7 +324,12 @@ def run_finetune_iter(param_file, machine_file):
     jdata_arginfo = run_jdata_arginfo()
     wrapper_jdata = {
         key: jdata[key]
-        for key in ("finetune_args", "finetune_model_source", "training_finetune_model")
+        for key in (
+            "finetune_args",
+            "finetune_model_branch",
+            "finetune_model_source",
+            "training_finetune_model",
+        )
         if key in jdata
     }
     normalized_input = copy.deepcopy(jdata)
