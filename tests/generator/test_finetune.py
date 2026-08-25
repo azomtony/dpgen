@@ -4,7 +4,11 @@ import os
 import tempfile
 import unittest
 
-from dpgen.generator.finetune import _get_finetune_args, prepare_finetune_jdata
+from dpgen.generator.finetune import (
+    _get_finetune_args,
+    _get_init_model_name,
+    prepare_finetune_jdata,
+)
 
 
 class TestFinetune(unittest.TestCase):
@@ -27,8 +31,28 @@ class TestFinetune(unittest.TestCase):
         self.assertEqual(prepared["train_backend"], "pytorch")
         self.assertEqual(prepared["training_finetune_model"], models)
         self.assertEqual(prepared["finetune_model_source"], "previous")
+        self.assertEqual(prepared["finetune_model_suffix"], ".pth")
         self.assertEqual(prepared["training_reuse_iter"], 1)
         self.assertNotIn("training_init_model", prepared)
+
+    def test_prepare_finetune_jdata_accepts_pt_checkpoint_models(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            models = []
+            for ii in range(4):
+                model = os.path.join(tmpdir, f"DPA-3.2-5M.{ii:03d}.pt")
+                with open(model, "w"):
+                    pass
+                models.append(model)
+
+            jdata = {
+                "numb_models": 4,
+                "finetune_model": models,
+            }
+
+            prepared = prepare_finetune_jdata(jdata)
+
+        self.assertEqual(prepared["finetune_model_suffix"], ".pt")
+        self.assertEqual(_get_init_model_name(prepared), "init.pt")
 
     def test_prepare_finetune_jdata_adds_use_pretrain_script_for_empty_model(self):
         with tempfile.NamedTemporaryFile(suffix=".pth") as model:
@@ -128,6 +152,17 @@ class TestFinetune(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "numb_models"):
                 prepare_finetune_jdata(jdata)
+
+    def test_prepare_finetune_jdata_rejects_mixed_model_suffixes(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as model0:
+            with tempfile.NamedTemporaryFile(suffix=".pth") as model1:
+                jdata = {
+                    "numb_models": 2,
+                    "training_finetune_model": [model0.name, model1.name],
+                }
+
+                with self.assertRaisesRegex(RuntimeError, "same suffix"):
+                    prepare_finetune_jdata(jdata)
 
     def test_prepare_finetune_jdata_rejects_unknown_source(self):
         with tempfile.NamedTemporaryFile(suffix=".pth") as model:

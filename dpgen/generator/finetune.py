@@ -41,7 +41,7 @@ def prepare_finetune_jdata(jdata):
     if not models:
         raise RuntimeError(
             "dpgen finetune requires training_finetune_model, or finetune_model, "
-            "to point to PyTorch .pth models."
+            "to point to PyTorch .pt or .pth models."
         )
     models = [os.path.expanduser(model) for model in models]
     jdata["training_finetune_model"] = models
@@ -59,7 +59,21 @@ def prepare_finetune_jdata(jdata):
 
     if jdata.get("mlp_engine", "dp") != "dp":
         raise RuntimeError("dpgen finetune currently supports mlp_engine='dp'.")
-    suffix = ".pth"
+    model_suffixes = {os.path.splitext(model)[1] for model in models}
+    valid_model_suffixes = {".pt", ".pth"}
+    bad_suffix = [
+        model
+        for model in models
+        if os.path.splitext(model)[1] not in valid_model_suffixes
+    ]
+    if bad_suffix:
+        raise RuntimeError(
+            "dpgen finetune expects .pt or .pth model files: "
+            + ", ".join(bad_suffix)
+        )
+    if len(model_suffixes) != 1:
+        raise RuntimeError("all fine-tune model files should use the same suffix.")
+    jdata["finetune_model_suffix"] = model_suffixes.pop()
 
     model_source = jdata.get("finetune_model_source", "previous")
     if model_source not in ("previous", "foundation"):
@@ -86,12 +100,6 @@ def prepare_finetune_jdata(jdata):
             "Cannot find fine-tune model file(s): " + ", ".join(missing_models)
         )
 
-    bad_suffix = [model for model in models if not model.endswith(suffix)]
-    if bad_suffix:
-        raise RuntimeError(
-            "dpgen finetune expects .pth model files: " + ", ".join(bad_suffix)
-        )
-
     if jdata.get("training_reuse_iter") is None or jdata["training_reuse_iter"] < 1:
         jdata["training_reuse_iter"] = 1
 
@@ -116,7 +124,11 @@ def _get_finetune_args(jdata, include_model_branch):
     return args
 
 
-def _make_train_finetune(iter_index, jdata, mdata):
+def _get_init_model_name(jdata):
+    return f"init{jdata.get('finetune_model_suffix', '.pth')}"
+
+
+def _make_train_finetune(iter_index, jdata, mdata, link_foundation):
     from dpgen.generator.run import default_train_input_file, make_train, train_name, train_task_fmt
     from dpgen.generator.lib.utils import make_iter_name
 
@@ -126,6 +138,8 @@ def _make_train_finetune(iter_index, jdata, mdata):
         model.pop("descriptor")
 
     make_train(iter_index, make_jdata, mdata)
+    if link_foundation:
+        _link_finetune_models(iter_index, jdata)
 
     if not _uses_pretrain_script(jdata):
         return
@@ -153,9 +167,11 @@ def _link_finetune_models(iter_index, jdata):
         task_old_path = os.path.join(work_path, train_task_fmt % ii, "old")
         create_path(task_old_path)
         target = os.path.abspath(model)
-        link_name = os.path.join(task_old_path, "init.pth")
-        if os.path.lexists(link_name):
-            os.remove(link_name)
+        link_name = os.path.join(task_old_path, _get_init_model_name(jdata))
+        for stale_name in ("init.pt", "init.pth"):
+            stale_path = os.path.join(task_old_path, stale_name)
+            if os.path.lexists(stale_path):
+                os.remove(stale_path)
         os.symlink(os.path.relpath(target, task_old_path), link_name)
 
 
@@ -212,7 +228,8 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
             extra_flags += " --skip-neighbor-stat"
         command = f"{train_command} train {train_input_file}{extra_flags}"
         if init_from_foundation:
-            init_flag = f"--finetune old/init.pth {finetune_args}".strip()
+            init_name = _get_init_model_name(jdata)
+            init_flag = f"--finetune old/{init_name} {finetune_args}".strip()
         else:
             init_flag = f"--init-model old/model.ckpt {finetune_args}".strip()
         command = (
@@ -235,7 +252,7 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
     if "srtab_file_path" in jdata.keys():
         forward_files.append(zbl_file)
     if init_from_foundation:
-        forward_files.append(os.path.join("old", "init.pth"))
+        forward_files.append(os.path.join("old", _get_init_model_name(jdata)))
     else:
         forward_files.append(os.path.join("old", "model.ckpt.pt"))
 
@@ -328,6 +345,7 @@ def run_finetune_iter(param_file, machine_file):
             "finetune_args",
             "finetune_model_branch",
             "finetune_model_source",
+            "finetune_model_suffix",
             "training_finetune_model",
         )
         if key in jdata
@@ -405,9 +423,12 @@ def run_finetune_iter(param_file, machine_file):
             sepline(f"{iter_name} {task_name}", "-")
             if jj == 0:
                 log_iter("make_train", ii, jj)
-                _make_train_finetune(ii, jdata, mdata)
-                if finetune_model_source == "foundation":
-                    _link_finetune_models(ii, jdata)
+                _make_train_finetune(
+                    ii,
+                    jdata,
+                    mdata,
+                    finetune_model_source == "foundation" or ii == 0,
+                )
             elif jj == 1:
                 log_iter("run_train", ii, jj)
                 if finetune_model_source == "foundation" or ii == 0:
