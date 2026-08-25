@@ -7,6 +7,7 @@ class TestCLI(unittest.TestCase):
         sp.check_output(["dpgen", "-h"])
         for subcommand in (
             "run",
+            "finetune",
             "simplify",
             "init_surf",
             "init_bulk",

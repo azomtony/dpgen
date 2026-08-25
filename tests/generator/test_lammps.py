@@ -56,6 +56,28 @@ class TestMakeLammpsInput(unittest.TestCase):
         self.assertNotIn("hybrid/overlay", result)
         self.assertNotIn("dispersion/d3", result)
 
+    def test_triclinic_box_conversion_is_commented(self):
+        """Test generated LAMMPS input does not force triclinic boxes."""
+        result = make_lammps_input(
+            self.ensemble,
+            self.conf_file,
+            self.graphs,
+            self.nsteps,
+            self.dt,
+            self.neidelay,
+            self.trj_freq,
+            self.mass_map,
+            self.temp,
+            {},
+            pres=1.0,
+            deepmd_version=self.deepmd_version,
+        )
+
+        self.assertIn("# box          tilt large", result)
+        self.assertIn("# change_box   all triclinic", result)
+        self.assertNotIn("\nbox          tilt large", result)
+        self.assertNotIn("\nchange_box   all triclinic", result)
+
     def test_d3_enabled_basic(self):
         """Test LAMMPS input with D3 dispersion enabled."""
         jdata = {

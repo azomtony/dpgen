@@ -94,12 +94,12 @@ def make_lammps_input(
     if neigh_modify_options:
         ret += f"neigh_modify    {' '.join(neigh_modify_options)}\n"
     ret += "\n"
-    ret += "box          tilt large\n"
+    ret += "# box          tilt large\n"
     if nbeads is None:
         ret += f'if "${{restart}} > 0" then "read_restart dpgen.restart.*" else "read_data {conf_file}"\n'
     else:
         ret += f'if "${{restart}} > 0" then "read_restart dpgen.restart${{ibead}}.*" else "read_data {conf_file}"\n'
-    ret += "change_box   all triclinic\n"
+    ret += "# change_box   all triclinic\n"
     for jj in range(len(mass_map)):
         ret += "mass            %d %f\n" % (jj + 1, mass_map[jj])  # noqa: UP031
     graph_list = ""

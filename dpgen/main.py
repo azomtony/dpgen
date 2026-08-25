@@ -12,6 +12,7 @@ from dpgen.data.gen import gen_init_bulk
 from dpgen.data.reaction import gen_init_reaction
 from dpgen.data.surf import gen_init_surf
 from dpgen.database.run import db_run
+from dpgen.generator.finetune import gen_finetune
 from dpgen.generator.run import gen_run
 from dpgen.gui import start_dpgui
 from dpgen.simplify.simplify import gen_simplify
@@ -112,6 +113,21 @@ def main_parser() -> argparse.ArgumentParser:
     parser_run.add_argument("MACHINE", type=str, help="machine file, json/yaml format")
     parser_run.add_argument("-d", "--debug", action="store_true", help="log debug info")
     parser_run.set_defaults(func=gen_run)
+
+    # finetune
+    parser_finetune = subparsers.add_parser(
+        "finetune", help="Fine-tune PyTorch DP models, then run exploration and FP."
+    )
+    parser_finetune.add_argument(
+        "PARAM", type=str, help="parameter file, json/yaml format"
+    )
+    parser_finetune.add_argument(
+        "MACHINE", type=str, help="machine file, json/yaml format"
+    )
+    parser_finetune.add_argument(
+        "-d", "--debug", action="store_true", help="log debug info"
+    )
+    parser_finetune.set_defaults(func=gen_finetune)
 
     # run/report
     parser_rr = subparsers.add_parser(
