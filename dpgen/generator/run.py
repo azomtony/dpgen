@@ -127,6 +127,8 @@ run_opt_file = os.path.join(ROOT_PATH, "generator/lib/calypso_run_opt.py")
 
 def _get_model_suffix(jdata) -> str:
     """Return the model suffix based on the backend."""
+    if jdata.get("finetune_model_type") == "dpa4c":
+        return ".pt2"
     mlp_engine = jdata.get("mlp_engine", "dp")
     if mlp_engine == "dp":
         suffix_map = {"tensorflow": ".pb", "pytorch": ".pth", "jax": ".savedmodel"}
@@ -983,7 +985,10 @@ def post_train_dp(iter_index, jdata, mdata):
     for ii in range(numb_models):
         model_name = f"frozen_model{suffix}"
         if jdata.get("dp_compress", False):
-            model_name = f"frozen_model_compressed{suffix}"
+            if jdata.get("finetune_model_type") == "dpa4c":
+                model_name = f"compressed_model{suffix}"
+            else:
+                model_name = f"frozen_model_compressed{suffix}"
 
         ofile = os.path.join(work_path, "graph.%03d%s" % (ii, suffix))  # noqa: UP031
         task_file = os.path.join(train_task_fmt % ii, model_name)
@@ -1170,11 +1175,11 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
 
     lmp_d3 = jdata.get("lmp_d3", {})
     d3_enabled = lmp_d3.get("enable", False) if lmp_d3 else False
+    dpa4c_enabled = jdata.get("finetune_model_type") == "dpa4c"
 
-    if not d3_enabled:
+    if not d3_enabled and not dpa4c_enabled:
         return lmp_lines
 
-    # D3 requires type maps (element symbols)
     type_map = jdata.get("type_map", [])
     type_map_str = " ".join(type_map)
 
@@ -1188,16 +1193,24 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
     if pair_coeff_idx is None:
         # If no pair_coeff found, add them after pair_style
         pair_style_idx = find_only_one_key(lmp_lines, ["pair_style"])
-        lmp_lines.insert(pair_style_idx + 1, "pair_coeff      * * deepmd\n")
-        lmp_lines.insert(
-            pair_style_idx + 2, f"pair_coeff      * * dispersion/d3 {type_map_str}\n"
-        )
+        if d3_enabled:
+            lmp_lines.insert(pair_style_idx + 1, "pair_coeff      * * deepmd\n")
+            lmp_lines.insert(
+                pair_style_idx + 2,
+                f"pair_coeff      * * dispersion/d3 {type_map_str}\n",
+            )
+        else:
+            lmp_lines.insert(pair_style_idx + 1, f"pair_coeff      * * {type_map_str}\n")
     else:
-        # Replace existing pair_coeff with D3 version
-        lmp_lines[pair_coeff_idx] = "pair_coeff      * * deepmd\n"
-        lmp_lines.insert(
-            pair_coeff_idx + 1, f"pair_coeff      * * dispersion/d3 {type_map_str}\n"
-        )
+        if d3_enabled:
+            # Replace existing pair_coeff with D3 version
+            lmp_lines[pair_coeff_idx] = "pair_coeff      * * deepmd\n"
+            lmp_lines.insert(
+                pair_coeff_idx + 1,
+                f"pair_coeff      * * dispersion/d3 {type_map_str}\n",
+            )
+        else:
+            lmp_lines[pair_coeff_idx] = f"pair_coeff      * * {type_map_str}\n"
 
     return lmp_lines
 

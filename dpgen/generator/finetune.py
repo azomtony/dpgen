@@ -21,9 +21,143 @@ import shlex
 from dpgen import SHORT_CMD, dlog
 
 
+DPA4C_TYPE_MAP = [
+    "H",
+    "He",
+    "Li",
+    "Be",
+    "B",
+    "C",
+    "N",
+    "O",
+    "F",
+    "Ne",
+    "Na",
+    "Mg",
+    "Al",
+    "Si",
+    "P",
+    "S",
+    "Cl",
+    "Ar",
+    "K",
+    "Ca",
+    "Sc",
+    "Ti",
+    "V",
+    "Cr",
+    "Mn",
+    "Fe",
+    "Co",
+    "Ni",
+    "Cu",
+    "Zn",
+    "Ga",
+    "Ge",
+    "As",
+    "Se",
+    "Br",
+    "Kr",
+    "Rb",
+    "Sr",
+    "Y",
+    "Zr",
+    "Nb",
+    "Mo",
+    "Tc",
+    "Ru",
+    "Rh",
+    "Pd",
+    "Ag",
+    "Cd",
+    "In",
+    "Sn",
+    "Sb",
+    "Te",
+    "I",
+    "Xe",
+    "Cs",
+    "Ba",
+    "La",
+    "Ce",
+    "Pr",
+    "Nd",
+    "Pm",
+    "Sm",
+    "Eu",
+    "Gd",
+    "Tb",
+    "Dy",
+    "Ho",
+    "Er",
+    "Tm",
+    "Yb",
+    "Lu",
+    "Hf",
+    "Ta",
+    "W",
+    "Re",
+    "Os",
+    "Ir",
+    "Pt",
+    "Au",
+    "Hg",
+    "Tl",
+    "Pb",
+    "Bi",
+    "Po",
+    "At",
+    "Rn",
+    "Fr",
+    "Ra",
+    "Ac",
+    "Th",
+    "Pa",
+    "U",
+    "Np",
+    "Pu",
+    "Am",
+    "Cm",
+    "Bk",
+    "Cf",
+    "Es",
+    "Fm",
+    "Md",
+    "No",
+    "Lr",
+    "Rf",
+    "Db",
+    "Sg",
+    "Bh",
+    "Hs",
+    "Mt",
+    "Ds",
+    "Rg",
+    "Cn",
+    "Nh",
+    "Fl",
+    "Mc",
+    "Lv",
+    "Ts",
+    "Og",
+]
+
+_FINETUNE_MODEL_TYPES = {"dp3", "dpa4c"}
+_DEEPMD_BACKEND_FLAGS = {"--pt", "--pt-expt", "--jax"}
+DPA4C_FROZEN_MODEL = "frozen_model.pt2"
+DPA4C_COMPRESSED_MODEL = "compressed_model.pt2"
+
+
 def prepare_finetune_jdata(jdata):
     """Return a fine-tune-ready copy of the run parameters."""
     jdata = copy.deepcopy(jdata)
+
+    finetune_model_type = jdata.get("finetune_model_type", "dp3")
+    if finetune_model_type not in _FINETUNE_MODEL_TYPES:
+        raise RuntimeError(
+            "finetune_model_type should be either 'dp3' or 'dpa4c'."
+        )
+    jdata["finetune_model_type"] = finetune_model_type
 
     if "finetune_model" in jdata:
         if (
@@ -89,6 +223,14 @@ def prepare_finetune_jdata(jdata):
         jdata["finetune_model_branch"] = model_branch
 
     numb_models = jdata.get("numb_models")
+    if (
+        finetune_model_type == "dpa4c"
+        and numb_models is not None
+        and len(models) == 1
+        and numb_models > 1
+    ):
+        models = models * numb_models
+        jdata["training_finetune_model"] = models
     if numb_models is not None and len(models) != numb_models:
         raise RuntimeError(
             "training_finetune_model should contain exactly numb_models entries."
@@ -103,6 +245,9 @@ def prepare_finetune_jdata(jdata):
     if jdata.get("training_reuse_iter") is None or jdata["training_reuse_iter"] < 1:
         jdata["training_reuse_iter"] = 1
 
+    if finetune_model_type == "dpa4c":
+        jdata["dp_train_skip_neighbor_stat"] = True
+
     if _uses_pretrain_script(jdata):
         finetune_args = jdata.get("finetune_args", "")
         if "--use-pretrain-script" not in finetune_args.split():
@@ -113,8 +258,64 @@ def prepare_finetune_jdata(jdata):
 
 
 def _uses_pretrain_script(jdata):
+    if jdata.get("finetune_model_type") == "dpa4c":
+        return True
     model = jdata.get("default_training_param", {}).get("model", {})
     return model.get("descriptor") == {} or model.get("fitting_net") == {}
+
+
+def _get_finetune_training_type_map(jdata):
+    if jdata.get("finetune_model_type") == "dpa4c":
+        return DPA4C_TYPE_MAP
+    return jdata["type_map"]
+
+
+def _get_train_backend_flag(jdata):
+    if jdata.get("finetune_model_type") == "dpa4c":
+        return "--pt-expt"
+    return "--pt"
+
+
+def _get_train_command(jdata, mdata):
+    train_command = mdata.get("train_command", "dp").strip()
+    train_backend_flag = _get_train_backend_flag(jdata)
+    command_tokens = shlex.split(train_command)
+    existing_backend_flags = _DEEPMD_BACKEND_FLAGS.intersection(command_tokens)
+    if existing_backend_flags:
+        if (
+            train_backend_flag == "--pt-expt"
+            and "--pt-expt" not in existing_backend_flags
+        ):
+            raise RuntimeError(
+                "finetune_model_type='dpa4c' requires train_command to use "
+                "'--pt-expt'."
+            )
+        return train_command
+    return f"{train_command} {train_backend_flag}"
+
+
+def _get_frozen_model_suffix(jdata):
+    if jdata.get("finetune_model_type") == "dpa4c":
+        return ".pt2"
+    return ".pth"
+
+
+def _get_freeze_command(jdata, train_command):
+    if jdata.get("finetune_model_type") == "dpa4c":
+        return (
+            f"{train_command} freeze -c model.ckpt.pt -o frozen_model "
+            "--lower-kind graph"
+        )
+    return f"{train_command} freeze"
+
+
+def _get_compress_command(jdata, train_command):
+    if jdata.get("finetune_model_type") == "dpa4c":
+        return (
+            f"{train_command} compress -i {DPA4C_FROZEN_MODEL} "
+            f"-o {DPA4C_COMPRESSED_MODEL}"
+        )
+    return f"{train_command} compress"
 
 
 def _get_finetune_args(jdata, include_model_branch):
@@ -129,10 +330,16 @@ def _get_init_model_name(jdata):
 
 
 def _make_train_finetune(iter_index, jdata, mdata, link_foundation):
-    from dpgen.generator.run import default_train_input_file, make_train, train_name, train_task_fmt
     from dpgen.generator.lib.utils import make_iter_name
+    from dpgen.generator.run import (
+        default_train_input_file,
+        make_train,
+        train_name,
+        train_task_fmt,
+    )
 
     make_jdata = copy.deepcopy(jdata)
+    make_jdata.pop("training_finetune_model", None)
     model = make_jdata["default_training_param"].get("model", {})
     if model.get("descriptor") == {}:
         model.pop("descriptor")
@@ -145,10 +352,12 @@ def _make_train_finetune(iter_index, jdata, mdata, link_foundation):
         return
 
     input_model = copy.deepcopy(jdata["default_training_param"]["model"])
-    input_model["type_map"] = jdata["type_map"]
+    input_model["type_map"] = _get_finetune_training_type_map(jdata)
     work_path = os.path.join(make_iter_name(iter_index), train_name)
     for ii in range(jdata["numb_models"]):
-        input_path = os.path.join(work_path, train_task_fmt % ii, default_train_input_file)
+        input_path = os.path.join(
+            work_path, train_task_fmt % ii, default_train_input_file
+        )
         if not os.path.isfile(input_path):
             continue
         with open(input_path) as fp:
@@ -195,7 +404,7 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
 
     numb_models = jdata["numb_models"]
     train_input_file = default_train_input_file
-    suffix = ".pth"
+    suffix = _get_frozen_model_suffix(jdata)
 
     if "srtab_file_path" in jdata.keys():
         zbl_file = os.path.basename(jdata.get("srtab_file_path", None))
@@ -205,8 +414,7 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
     except KeyError:
         mdata = set_version(mdata)
 
-    train_command = mdata.get("train_command", "dp").strip()
-    train_command += " --pt"
+    train_command = _get_train_command(jdata, mdata)
     finetune_args = _get_finetune_args(jdata, init_from_foundation)
 
     iter_name = make_iter_name(iter_index)
@@ -237,10 +445,10 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
             f"{command} {init_flag}; "
             f"else {command} --restart model.ckpt; fi }}"
         )
-        commands.append(f"/bin/sh -c {shlex.quote(command)}")
-        commands.append(f"{train_command} freeze")
+        commands.append(f"/bin/bash -c {shlex.quote(command)}")
+        commands.append(_get_freeze_command(jdata, train_command))
         if jdata.get("dp_compress", False):
-            commands.append(f"{train_command} compress")
+            commands.append(_get_compress_command(jdata, train_command))
     else:
         raise RuntimeError(
             "DP-GEN currently only supports for DeePMD-kit 1.x to 3.x version!"
@@ -264,7 +472,10 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
         "model.ckpt.pt",
     ]
     if jdata.get("dp_compress", False):
-        backward_files.append(f"frozen_model_compressed{suffix}")
+        if jdata.get("finetune_model_type") == "dpa4c":
+            backward_files.append(DPA4C_COMPRESSED_MODEL)
+        else:
+            backward_files.append(f"frozen_model_compressed{suffix}")
 
     if not jdata.get("one_h5", False):
         init_data_sys = [
@@ -343,6 +554,7 @@ def run_finetune_iter(param_file, machine_file):
         key: jdata[key]
         for key in (
             "finetune_args",
+            "finetune_model_type",
             "finetune_model_branch",
             "finetune_model_source",
             "finetune_model_suffix",

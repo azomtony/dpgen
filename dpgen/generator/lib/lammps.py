@@ -156,6 +156,10 @@ def make_lammps_input(
         type_map_str = " ".join(type_map)
         ret += "pair_coeff      * * deepmd\n"
         ret += f"pair_coeff      * * dispersion/d3 {type_map_str}\n"
+    elif jdata.get("finetune_model_type") == "dpa4c":
+        type_map = jdata.get("type_map", [])
+        type_map_str = " ".join(type_map)
+        ret += f"pair_coeff      * * {type_map_str}\n"
     else:
         ret += "pair_coeff      * *\n"
     ret += "\n"

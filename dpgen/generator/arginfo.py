@@ -130,6 +130,10 @@ def training_args_dp() -> list[Argument]:
     doc_one_h5 = "When using DeePMD-kit, all of the input data will be merged into one HDF5 file."
     doc_training_init_frozen_model = "At interation 0, initilize the model parameters from the given frozen models. Number of element should be equal to numb_models."
     doc_training_finetune_model = "At interation 0, finetune the model parameters from the given frozen models. Number of element should be equal to numb_models."
+    doc_finetune_model_type = (
+        "Fine-tune model type. Use 'dp3' for the default PyTorch backend, or "
+        "'dpa4c' for DPA4C foundation models with the pt-expt backend."
+    )
 
     return [
         Argument(
@@ -225,6 +229,13 @@ def training_args_dp() -> list[Argument]:
             list[str],
             optional=True,
             doc=doc_training_finetune_model,
+        ),
+        Argument(
+            "finetune_model_type",
+            str,
+            optional=True,
+            default="dp3",
+            doc=doc_finetune_model_type,
         ),
     ]
 

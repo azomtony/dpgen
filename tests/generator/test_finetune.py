@@ -5,8 +5,16 @@ import tempfile
 import unittest
 
 from dpgen.generator.finetune import (
+    DPA4C_COMPRESSED_MODEL,
+    DPA4C_FROZEN_MODEL,
+    DPA4C_TYPE_MAP,
+    _get_compress_command,
     _get_finetune_args,
+    _get_finetune_training_type_map,
+    _get_freeze_command,
+    _get_frozen_model_suffix,
     _get_init_model_name,
+    _get_train_command,
     prepare_finetune_jdata,
 )
 
@@ -109,6 +117,71 @@ class TestFinetune(unittest.TestCase):
         self.assertIn("--model-branch Omat24", _get_finetune_args(prepared, True))
         self.assertNotIn("--model-branch Omat24", _get_finetune_args(prepared, False))
 
+    def test_prepare_finetune_jdata_accepts_dpa4c_preset(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as model:
+            jdata = {
+                "numb_models": 1,
+                "finetune_model": model.name,
+                "finetune_model_type": "dpa4c",
+                "type_map": ["C", "H", "O"],
+                "default_training_param": {
+                    "model": {
+                        "descriptor": {"type": "dpa4c"},
+                    }
+                },
+            }
+
+            prepared = prepare_finetune_jdata(jdata)
+
+        self.assertEqual(prepared["finetune_model_type"], "dpa4c")
+        self.assertTrue(prepared["dp_train_skip_neighbor_stat"])
+        self.assertIn("--use-pretrain-script", prepared["finetune_args"])
+        self.assertEqual(
+            _get_train_command(prepared, {"train_command": "dp"}), "dp --pt-expt"
+        )
+        self.assertEqual(
+            _get_train_command(prepared, {"train_command": "dp --pt-expt"}),
+            "dp --pt-expt",
+        )
+        self.assertEqual(
+            _get_freeze_command(prepared, "dp --pt-expt"),
+            "dp --pt-expt freeze -c model.ckpt.pt -o frozen_model "
+            "--lower-kind graph",
+        )
+        self.assertEqual(
+            _get_compress_command(prepared, "dp --pt-expt"),
+            f"dp --pt-expt compress -i {DPA4C_FROZEN_MODEL} "
+            f"-o {DPA4C_COMPRESSED_MODEL}",
+        )
+        self.assertEqual(_get_frozen_model_suffix(prepared), ".pt2")
+        self.assertEqual(_get_finetune_training_type_map(prepared), DPA4C_TYPE_MAP)
+        self.assertEqual(prepared["type_map"], ["C", "H", "O"])
+
+    def test_dpa4c_single_foundation_model_is_reused_for_all_models(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as model:
+            jdata = {
+                "numb_models": 4,
+                "finetune_model": model.name,
+                "finetune_model_type": "dpa4c",
+            }
+
+            prepared = prepare_finetune_jdata(jdata)
+
+        self.assertEqual(prepared["training_finetune_model"], [model.name] * 4)
+
+    def test_dpa4c_rejects_non_experimental_pytorch_backend(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as model:
+            prepared = prepare_finetune_jdata(
+                {
+                    "numb_models": 1,
+                    "finetune_model": model.name,
+                    "finetune_model_type": "dpa4c",
+                }
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "--pt-expt"):
+            _get_train_command(prepared, {"train_command": "dp --pt"})
+
     def test_prepare_finetune_jdata_rejects_non_pytorch_backend(self):
         with tempfile.NamedTemporaryFile(suffix=".pb") as model:
             jdata = {
@@ -173,6 +246,17 @@ class TestFinetune(unittest.TestCase):
             }
 
             with self.assertRaisesRegex(RuntimeError, "finetune_model_source"):
+                prepare_finetune_jdata(jdata)
+
+    def test_prepare_finetune_jdata_rejects_unknown_model_type(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as model:
+            jdata = {
+                "numb_models": 1,
+                "finetune_model": model.name,
+                "finetune_model_type": "dpa5",
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "finetune_model_type"):
                 prepare_finetune_jdata(jdata)
 
 

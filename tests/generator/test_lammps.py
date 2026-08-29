@@ -178,6 +178,30 @@ class TestMakeLammpsInput(unittest.TestCase):
         self.assertNotIn("hybrid/overlay", result)
         self.assertNotIn("dispersion/d3", result)
 
+    def test_dpa4c_pair_coeff_uses_type_map(self):
+        """Test DPA4C LAMMPS input includes element mapping for pt2 models."""
+        jdata = {
+            "finetune_model_type": "dpa4c",
+            "type_map": ["O", "H"],
+        }
+        result = make_lammps_input(
+            self.ensemble,
+            self.conf_file,
+            ["compressed_model.pt2"],
+            self.nsteps,
+            self.dt,
+            self.neidelay,
+            self.trj_freq,
+            self.mass_map,
+            self.temp,
+            jdata,
+            pres=1.0,
+            deepmd_version="3.2",
+        )
+
+        self.assertIn("pair_style      deepmd compressed_model.pt2", result)
+        self.assertIn("pair_coeff      * * O H", result)
+
     def test_d3_with_neigh_modify_one(self):
         """Test D3 with lmp_neigh_modify_one parameter."""
         jdata = {
