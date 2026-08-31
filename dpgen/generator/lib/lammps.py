@@ -61,6 +61,8 @@ def make_lammps_input(
         ret += "variable        ibead           uloop %d pad\n" % (power - 1)  # noqa: UP031
     if nbeads is not None:
         ret += "atom_modify        map yes\n"
+    elif jdata.get("finetune_model_type") == "dpa4c":
+        ret += "atom_modify     map yes\n"
     ret += "variable        THERMO_FREQ     equal %d\n" % trj_freq  # noqa: UP031
     ret += "variable        DUMP_FREQ       equal %d\n" % trj_freq  # noqa: UP031
     ret += f"variable        TEMP            equal {temp:f}\n"

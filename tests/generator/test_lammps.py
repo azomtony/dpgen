@@ -52,6 +52,7 @@ class TestMakeLammpsInput(unittest.TestCase):
         # Should contain basic deepmd pair_style
         self.assertIn("pair_style      deepmd model.pb", result)
         self.assertIn("pair_coeff      * *", result)
+        self.assertNotIn("atom_modify     map yes", result)
         # Should NOT contain hybrid/overlay or dispersion/d3
         self.assertNotIn("hybrid/overlay", result)
         self.assertNotIn("dispersion/d3", result)
@@ -200,6 +201,7 @@ class TestMakeLammpsInput(unittest.TestCase):
         )
 
         self.assertIn("pair_style      deepmd compressed_model.pt2", result)
+        self.assertIn("atom_modify     map yes", result)
         self.assertIn("pair_coeff      * * O H", result)
 
     def test_d3_with_neigh_modify_one(self):

@@ -997,6 +997,18 @@ def post_train_dp(iter_index, jdata, mdata):
         os.symlink(task_file, ofile)
 
 
+def _format_lammps_model_devi_command(
+    model_devi_exec, restart, nbeads=None, dpa4c_enabled=False
+):
+    if dpa4c_enabled:
+        input_args = f"-var restart {restart} -in input.lammps"
+    else:
+        input_args = f"-i input.lammps -v restart {restart}"
+    if nbeads is not None:
+        input_args = f"-p {nbeads}x1 {input_args}"
+    return f"{model_devi_exec} {input_args}"
+
+
 def _get_param_alias(jdata, names):
     for ii in names:
         if ii in jdata:
@@ -1211,6 +1223,33 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
             )
         else:
             lmp_lines[pair_coeff_idx] = f"pair_coeff      * * {type_map_str}\n"
+
+    return lmp_lines
+
+
+def revise_lmp_input_atom_modify(lmp_lines, jdata=None):
+    """Add atom map support required by DPA4C LAMMPS inference."""
+    if jdata is None or jdata.get("finetune_model_type") != "dpa4c":
+        return lmp_lines
+
+    for line in lmp_lines:
+        words = line.split()
+        if len(words) >= 3 and words[:3] == ["atom_modify", "map", "yes"]:
+            return lmp_lines
+
+    atom_style_idx = None
+    units_idx = None
+    for idx, line in enumerate(lmp_lines):
+        words = line.split()
+        if len(words) >= 2 and words[:2] == ["atom_style", "atomic"]:
+            atom_style_idx = idx
+            break
+        if words and words[0] == "units":
+            units_idx = idx
+
+    insert_idx = atom_style_idx if atom_style_idx is not None else units_idx
+    if insert_idx is not None:
+        lmp_lines.insert(insert_idx + 1, "atom_modify     map yes\n")
 
     return lmp_lines
 
@@ -1629,6 +1668,7 @@ def _make_model_devi_revmat(iter_index, jdata, mdata, conf_systems):
                             )
                             # Add D3 pair_coeff and neigh_modify support for templates
                             lmp_lines = revise_lmp_input_pair_coeff(lmp_lines, jdata)
+                            lmp_lines = revise_lmp_input_atom_modify(lmp_lines, jdata)
                             lmp_lines = revise_lmp_input_neigh_modify(lmp_lines, jdata)
                     else:
                         if len(lmp_lines[template_pair_deepmd_idx].split()) != (
@@ -1654,6 +1694,7 @@ def _make_model_devi_revmat(iter_index, jdata, mdata, conf_systems):
                             )
                             # Add D3 pair_coeff and neigh_modify support for templates
                             lmp_lines = revise_lmp_input_pair_coeff(lmp_lines, jdata)
+                            lmp_lines = revise_lmp_input_atom_modify(lmp_lines, jdata)
                             lmp_lines = revise_lmp_input_neigh_modify(lmp_lines, jdata)
                 # use revise_lmp_input_model to raise error message if "part_style" or "deepmd" not found
                 else:
@@ -1668,6 +1709,7 @@ def _make_model_devi_revmat(iter_index, jdata, mdata, conf_systems):
 
                 # Add D3 pair_coeff and neigh_modify support for templates
                 lmp_lines = revise_lmp_input_pair_coeff(lmp_lines, jdata)
+                lmp_lines = revise_lmp_input_atom_modify(lmp_lines, jdata)
                 lmp_lines = revise_lmp_input_neigh_modify(lmp_lines, jdata)
 
                 lmp_lines = revise_lmp_input_dump(
@@ -2194,10 +2236,27 @@ def run_md_model_devi(iter_index, jdata, mdata):
     model_devi_engine = jdata.get("model_devi_engine", "lammps")
     if model_devi_engine == "lammps":
         nbeads = jdata["model_devi_jobs"][iter_index].get("nbeads")
+        dpa4c_enabled = jdata.get("finetune_model_type") == "dpa4c"
+        fresh_command = _format_lammps_model_devi_command(
+            model_devi_exec, 0, nbeads=nbeads, dpa4c_enabled=dpa4c_enabled
+        )
+        restart_command = _format_lammps_model_devi_command(
+            model_devi_exec, 1, nbeads=nbeads, dpa4c_enabled=dpa4c_enabled
+        )
         if nbeads is None:
-            command = f"{{ if [ ! -f dpgen.restart.10000 ]; then {model_devi_exec} -i input.lammps -v restart 0; else {model_devi_exec} -i input.lammps -v restart 1; fi }}"
+            command = (
+                "{ if [ ! -f dpgen.restart.10000 ]; then "
+                f"{fresh_command}; else {restart_command}; fi }}"
+            )
         else:
-            command = f"{{ all_exist=true; for i in $(seq -w 1 {nbeads}); do [[ ! -f dpgen.restart${{i}}.10000 ]] && {{ all_exist=false; break; }}; done; $all_exist && {{ {model_devi_exec} -p {nbeads}x1 -i input.lammps -v restart 1; }} || {{ {model_devi_exec} -p {nbeads}x1 -i input.lammps -v restart 0; }} }}"
+            command = (
+                "{ all_exist=true; "
+                f"for i in $(seq -w 1 {nbeads}); do "
+                '[[ ! -f dpgen.restart${i}.10000 ]] && '
+                "{ all_exist=false; break; }; "
+                "done; "
+                f"$all_exist && {{ {restart_command}; }} || {{ {fresh_command}; }} }}"
+            )
         command = f"/bin/bash -c {shlex.quote(command)}"
         commands = [command]
 
