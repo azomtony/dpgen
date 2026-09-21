@@ -177,3 +177,23 @@ starts include the log path; completions include elapsed time and stage progress
 Exploration lists the model ensemble shared by its tasks. System IDs correspond
 to `sys_configs` indices. Tasks still running report their status every 60 seconds.
 Failures include the exit code and log paths.
+
+To use another environment for freezing in interactive mode, add
+`command_envs` under `train.resources`:
+
+```json
+"command_envs": {
+  "freeze": {
+    "source_list": ["/absolute/path/to/dp-freeze.sh"]
+  }
+}
+```
+
+Each training command starts in a fresh Bash shell. The freeze override replaces
+`source_list` for that command; it does not source the training script first.
+Other setup fields can also be overridden, and `envs` is merged with the stage's
+environment variables. An optional `compress` entry configures compression;
+without it, compression uses the normal training environment. Use `dp` from PATH
+in the training command so each environment selects its own executable. An
+absolute executable path continues to select that specific executable.
+These overrides apply only to interactive (`--gpus`) execution.

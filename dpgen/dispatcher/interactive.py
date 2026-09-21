@@ -128,8 +128,7 @@ class LocalSubmission:
             resume += 1
         return resume, keys
 
-    def _script(self, group, directory=None, resume=0, keys=None):
-        resources = self.resources
+    def _environment_lines(self, group, resources):
         lines = ["set -e"]
         lines.extend(resources.get("prepend_script", []))
         if resources.get("module_purge", False):
@@ -152,10 +151,16 @@ class LocalSubmission:
             lines.append(f"export {key}={shlex.quote(str(value))}")
         # Set this last so stage setup cannot overwrite the task's allocation.
         lines.append("export CUDA_VISIBLE_DEVICES=" + ",".join(map(str, group)))
+        return lines
+
+    def _script(self, group, directory=None, resume=0, keys=None):
+        resources = self.resources
         if directory is None:
+            lines = self._environment_lines(group, resources)
             lines.append(" && ".join(self.commands) + " || exit $?")
             lines.extend(resources.get("append_script", []))
         else:
+            lines = ["set -e"]
             progress = directory / ".dpgen-local-progress"
             progress.mkdir(exist_ok=True)
             # Discard stale downstream successes before restarting an earlier step.
@@ -166,7 +171,21 @@ class LocalSubmission:
                 marker = shlex.quote(str(progress / f"{index:03d}.done"))
                 temporary = shlex.quote(str(progress / f"{index:03d}.tmp"))
                 lines.append(f"echo 'DP-GEN command {index + 1}: started'")
-                lines.append("{\n" + command + "\n} || exit $?")
+                name = "command"
+                if index < len(self.commands):
+                    name = {0: "train", 1: "freeze", 2: "compress"}.get(
+                        index, "command"
+                    )
+                override = resources.get("command_envs", {}).get(name, {})
+                command_resources = {**resources, **override}
+                command_resources["envs"] = {
+                    **resources.get("envs", {}),
+                    **override.get("envs", {}),
+                }
+                setup = self._environment_lines(group, command_resources)
+                setup.append(command)
+                # A fresh shell prevents the training environment leaking into freeze.
+                lines.append("bash -c " + shlex.quote("\n".join(setup)) + " || exit $?")
                 lines.append(f"printf '%s\\n' {shlex.quote(keys[index])} > {temporary}")
                 lines.append(f"mv {temporary} {marker}")
                 lines.append(f"echo 'DP-GEN command {index + 1}: completed'")

@@ -19,6 +19,13 @@
       ],
       "envs": {
         "OMP_NUM_THREADS": "1"
+      },
+      "command_envs": {
+        "freeze": {
+          "source_list": [
+            "/absolute/path/to/dp-freeze.sh"
+          ]
+        }
       }
     }
   },

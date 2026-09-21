@@ -268,6 +268,37 @@ Path("result.json").write_text(json.dumps({"start": start, "end": time.monotonic
                     len((task / "train-count").read_text().splitlines()), 2
                 )
 
+    def test_freeze_uses_separate_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "00.train"
+            task = root / "000"
+            task.mkdir(parents=True)
+            train_setup = Path(tmp) / "train.sh"
+            freeze_setup = Path(tmp) / "freeze.sh"
+            train_setup.write_text(
+                "export DPGEN_TEST_ENV=train\nexport DPGEN_TRAIN_ONLY=yes\n"
+            )
+            freeze_setup.write_text("export DPGEN_TEST_ENV=freeze\n")
+            resources = {
+                "source_list": [str(train_setup)],
+                "command_envs": {"freeze": {"source_list": [str(freeze_setup)]}},
+            }
+            commands = [
+                'test "$DPGEN_TEST_ENV" = train; echo trained >> count',
+                'test "$DPGEN_TEST_ENV" = freeze; test -z "${DPGEN_TRAIN_ONLY:-}"; '
+                'test "$CUDA_VISIBLE_DEVICES" = 2; test -f allow-freeze',
+            ]
+            with interactive_execution(self.args("--gpus", "2")):
+                with self.assertRaises(RuntimeError):
+                    local_submission(
+                        resources, commands, root, ["000"], "log", "log"
+                    ).run_submission()
+                (task / "allow-freeze").touch()
+                local_submission(
+                    resources, commands, root, ["000"], "log", "log"
+                ).run_submission()
+            self.assertEqual((task / "count").read_text().splitlines(), ["trained"])
+
     def test_empty_stage(self):
         with interactive_execution(self.args("--gpus", "0")):
             local_submission({}, [], ".", [], "log", "log").run_submission()
