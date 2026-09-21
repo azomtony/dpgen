@@ -114,3 +114,50 @@ In the machine parameter, {dargs:argument}`context_type <run_mdata/fp/machine/co
 In the resources parameter, we set {dargs:argument}`gpu_per_node <run_mdata/fp/resources/gpu_per_node>` to 0 since it is cost-effective to use the CPU for VASP calculations.
 
 Explicit descriptions of keys in machine.json will be given in the following section.
+
+## Interactive GPU execution
+
+Both `run` and `finetune` can execute directly inside an existing interactive
+GPU allocation. Keep the parameter and machine files:
+
+```sh
+dpgen finetune param.json machine.json --gpus 0 1 2 3
+dpgen run param.json machine.json --gpus 0 1 2 3 --gpus-per-job 2
+```
+
+`--gpus` enables local execution instead of batch submission for training,
+exploration, and labeling. The default is one GPU per task. Four GPUs with
+`--gpus-per-job 2` provide two concurrent tasks. The GPU count must be divisible
+by the number per job. A freed slot immediately starts the next pending task.
+All tasks in a stage must succeed before the workflow advances.
+
+GPU numbers are CUDA device IDs written directly to `CUDA_VISIBLE_DEVICES`,
+not indices into an inherited visibility list. Specify only devices assigned
+to your interactive allocation. Each task runs in a separate Bash process in
+its existing task directory. Stage logs are appended there. Scheduler settings,
+remote staging, and batch `group_size` are bypassed in this mode.
+
+The machine file still supplies each stage's `command` and `resources`.
+Local setup executes `prepend_script`, optional `module_purge`, `module_unload_list`, `module_list`,
+`source_list`, then exports `envs`. It sets the task's GPU visibility after
+setup, executes the stage commands, then runs `append_script` on success.
+Use absolute paths for environment scripts; scripts are sourced from task
+directories. Module commands require initialization through `prepend_script`
+if they are not already available in a non-interactive Bash shell.
+
+See `examples/machine/interactive/machine.json`: training and LAMMPS source
+the same environment script, while VASP sources a different script. Replace
+the example paths and commands with those for your installation. VASP must be
+a GPU-enabled build. Put required MPI launch options in the stage command;
+resource fields such as `cpu_per_node` do not create an MPI launcher in local
+mode. Likewise, exposing several GPUs does not automatically enable distributed
+training or multi-GPU LAMMPS/VASP execution. Set CPU thread limits in `envs` to
+avoid oversubscribing the allocation when running concurrent tasks.
+
+On a task failure or Ctrl-C, the executor terminates active local process groups
+and does not advance the workflow record. Restart using the same command:
+completed stages are skipped using `record.dpgen`, while an interrupted stage
+is executed again, using application checkpoints where the existing workflow
+supports them. No independent per-task completion cache is maintained.
+
+Without `--gpus`, existing batch submission behavior is unchanged.

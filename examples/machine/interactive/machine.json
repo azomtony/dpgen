@@ -1,0 +1,67 @@
+{
+  "api_version": "1.0",
+  "deepmd_version": "3.0",
+  "train": {
+    "command": "dp",
+    "machine": {
+      "batch_type": "Shell",
+      "context_type": "LocalContext",
+      "local_root": "./",
+      "remote_root": "./"
+    },
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 1,
+      "gpu_per_node": 1,
+      "group_size": 1,
+      "source_list": [
+        "/absolute/path/to/dp-lammps.sh"
+      ],
+      "envs": {
+        "OMP_NUM_THREADS": "1"
+      }
+    }
+  },
+  "model_devi": {
+    "command": "lmp",
+    "machine": {
+      "batch_type": "Shell",
+      "context_type": "LocalContext",
+      "local_root": "./",
+      "remote_root": "./"
+    },
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 1,
+      "gpu_per_node": 1,
+      "group_size": 1,
+      "source_list": [
+        "/absolute/path/to/dp-lammps.sh"
+      ],
+      "envs": {
+        "OMP_NUM_THREADS": "1"
+      }
+    }
+  },
+  "fp": {
+    "command": "mpirun -np 1 vasp_std",
+    "machine": {
+      "batch_type": "Shell",
+      "context_type": "LocalContext",
+      "local_root": "./",
+      "remote_root": "./"
+    },
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 1,
+      "gpu_per_node": 1,
+      "group_size": 1,
+      "source_list": [
+        "/absolute/path/to/vasp-gpu.sh"
+      ],
+      "envs": {
+        "OMP_NUM_THREADS": "1"
+      }
+    }
+  }
+}

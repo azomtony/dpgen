@@ -105,6 +105,8 @@ def main_parser() -> argparse.ArgumentParser:
     )
     parser_init_reaction.set_defaults(func=gen_init_reaction)
 
+    from dpgen.dispatcher.interactive import add_interactive_args
+
     # run
     parser_run = subparsers.add_parser(
         "run", help="Main process of Deep Potential Generator."
@@ -112,6 +114,7 @@ def main_parser() -> argparse.ArgumentParser:
     parser_run.add_argument("PARAM", type=str, help="parameter file, json/yaml format")
     parser_run.add_argument("MACHINE", type=str, help="machine file, json/yaml format")
     parser_run.add_argument("-d", "--debug", action="store_true", help="log debug info")
+    add_interactive_args(parser_run)
     parser_run.set_defaults(func=gen_run)
 
     # finetune
@@ -127,6 +130,7 @@ def main_parser() -> argparse.ArgumentParser:
     parser_finetune.add_argument(
         "-d", "--debug", action="store_true", help="log debug info"
     )
+    add_interactive_args(parser_finetune)
     parser_finetune.set_defaults(func=gen_finetune)
 
     # run/report

@@ -683,7 +683,10 @@ def gen_finetune(args):
         if args.debug:
             dlog.setLevel(logging.DEBUG)
         dlog.info("start fine-tuning")
-        run_finetune_iter(args.PARAM, args.MACHINE)
+        from dpgen.dispatcher.interactive import interactive_execution
+
+        with interactive_execution(args):
+            run_finetune_iter(args.PARAM, args.MACHINE)
         dlog.info("finished")
 
 

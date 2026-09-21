@@ -19,6 +19,14 @@ def make_submission(
     outlog,
     errlog,
 ):
+    from dpgen.dispatcher.interactive import local_submission
+
+    local = local_submission(
+        mdata_resources, commands, work_path, run_tasks, outlog, errlog
+    )
+    if local is not None:
+        return local
+
     if mdata_machine.get("local_root", "./") != "./":
         raise RuntimeError("local_root must be './' in dpgen's machine.json.")
 

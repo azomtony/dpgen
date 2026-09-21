@@ -5923,7 +5923,10 @@ def gen_run(args):
         if args.debug:
             dlog.setLevel(logging.DEBUG)
         dlog.info("start running")
-        run_iter(args.PARAM, args.MACHINE)
+        from dpgen.dispatcher.interactive import interactive_execution
+
+        with interactive_execution(args):
+            run_iter(args.PARAM, args.MACHINE)
         dlog.info("finished")
 
 
