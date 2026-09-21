@@ -156,18 +156,30 @@ avoid oversubscribing the allocation when running concurrent tasks.
 
 On a task failure or Ctrl-C, the executor terminates active local process groups
 and does not advance the workflow record. Restart using the same command:
-completed stages are skipped using `record.dpgen`. Training tasks record each
-successful command in `.dpgen-local-progress` inside the model directory. If
-freeze fails after training succeeds, the next launch skips training and retries
-freeze, then compression if enabled. Fully completed models are skipped. Changing
-`input.json` or an earlier command invalidates the affected completion records.
-Environment changes do not invalidate successful training, allowing a freeze
-environment problem to be fixed without retraining. If you intentionally replace
-training data or remove generated outputs, remove the model's
-`.dpgen-local-progress` directory to force its commands to execute again.
-Runs made before this tracking was added have no success records and use the
-existing training checkpoint restart behavior. Exploration and labeling retry
-an interrupted stage using the existing application restart behavior.
+completed stages are skipped using `record.dpgen`. Every local task records each
+successful command in `.dpgen-local-progress` inside its task directory.
+Completed training models, exploration trajectories, and labeling tasks are
+skipped when an interrupted stage is restarted. Pending tasks start normally;
+interrupted or failed commands run again, using application restart files where
+the existing workflow supports them. This does not add electronic-step restart
+support to VASP or create checkpoints inside an executable.
+
+If freeze fails after training succeeds, the next launch skips training and retries
+freeze, then compression if enabled. Commands are recorded only after a successful
+exit, using an atomic marker rename. A changed command invalidates that command
+and subsequent commands. Changes to `input.json`, the standard LAMMPS inputs
+(`input.lammps`, `conf.lmp`, `job.json`, `input.plumed`), or VASP inputs (`INCAR`,
+`POSCAR`, `KPOINTS`, `POTCAR`) invalidate the corresponding task's completion records.
+Environment changes do not invalidate successes, allowing an environment problem
+to be fixed without rerunning completed calculations. If you intentionally replace
+other inputs (such as training data or exploration models), or remove generated
+outputs, remove the task's `.dpgen-local-progress` directory to force its commands
+to execute again. Preserve this directory when moving or backing up a run.
+
+Runs made before tracking was added have no success records. Their completed tasks
+cannot be reliably identified by this mechanism and may run again. There is also
+a small interruption window between an executable finishing and its success
+marker being written; a task interrupted in that window may run again.
 
 Without `--gpus`, existing batch submission behavior is unchanged.
 

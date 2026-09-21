@@ -78,16 +78,18 @@ Path("result.json").write_text(json.dumps({"start": start, "end": time.monotonic
                         if a["gpus"] != b["gpus"]
                     )
                 )
+                (root / "label").mkdir()
                 local_submission(
                     {"envs": {"STAGE": "vasp"}},
                     [command],
                     root,
-                    tasks[:1],
+                    ["label"],
                     "log",
                     "err",
                 ).run_submission()
                 self.assertEqual(
-                    json.loads((root / "0/result.json").read_text())["stage"], "vasp"
+                    json.loads((root / "label/result.json").read_text())["stage"],
+                    "vasp",
                 )
             self.assertIsNone(local_submission({}, [], root, [], "log", "log"))
 
@@ -298,6 +300,66 @@ Path("result.json").write_text(json.dumps({"start": start, "end": time.monotonic
                     resources, commands, root, ["000"], "log", "log"
                 ).run_submission()
             self.assertEqual((task / "count").read_text().splitlines(), ["trained"])
+
+    def test_exploration_and_labeling_resume_after_interrupt(self):
+        import time
+        from unittest.mock import patch
+
+        real_sleep = time.sleep
+        for stage in ("01.model_devi", "02.fp"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "iter.000000" / stage
+                tasks = ["task.000.000000", "task.000.000001", "task.001.000000"]
+                for task in tasks:
+                    (root / task).mkdir(parents=True)
+                command = (
+                    "echo attempt >> attempts; "
+                    'case "$PWD" in */task.000.000001) '
+                    "touch started; while [ ! -f allow ]; do sleep 0.05; done;; esac; "
+                    "echo completed >> successes"
+                )
+                interrupted = False
+
+                def interrupt_when_second_task_starts(delay):
+                    nonlocal interrupted
+                    if not interrupted and (root / tasks[1] / "started").exists():
+                        interrupted = True
+                        raise KeyboardInterrupt
+                    real_sleep(delay)
+
+                with interactive_execution(self.args("--gpus", "0")):
+                    with patch(
+                        "dpgen.dispatcher.interactive.time.sleep",
+                        side_effect=interrupt_when_second_task_starts,
+                    ):
+                        with self.assertRaises(KeyboardInterrupt):
+                            local_submission(
+                                {}, [command], root, tasks, "log", "log"
+                            ).run_submission()
+                    self.assertTrue(
+                        (root / tasks[0] / ".dpgen-local-progress/000.done").exists()
+                    )
+                    self.assertFalse(
+                        (root / tasks[1] / ".dpgen-local-progress/000.done").exists()
+                    )
+                    self.assertFalse((root / tasks[2] / "attempts").exists())
+                    (root / tasks[1] / "allow").touch()
+                    local_submission(
+                        {}, [command], root, tasks, "log", "log"
+                    ).run_submission()
+                    # Simulate another restart: every task is now skipped.
+                    local_submission(
+                        {}, [command], root, tasks, "log", "log"
+                    ).run_submission()
+                for task, attempts in zip(tasks, [1, 2, 1]):
+                    self.assertEqual(
+                        len((root / task / "attempts").read_text().splitlines()),
+                        attempts,
+                    )
+                    self.assertEqual(
+                        (root / task / "successes").read_text().splitlines(),
+                        ["completed"],
+                    )
 
     def test_empty_stage(self):
         with interactive_execution(self.args("--gpus", "0")):

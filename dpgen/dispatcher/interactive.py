@@ -113,9 +113,15 @@ class LocalSubmission:
     def _resume_state(self, directory):
         """Match successful command prefixes against the current input and commands."""
         digest = hashlib.sha256()
-        input_file = directory / "input.json"
-        if input_file.is_file():
-            digest.update(input_file.read_bytes())
+        input_names = ["input.json"]
+        if self.work_path.name == "01.model_devi":
+            input_names += ["input.lammps", "conf.lmp", "job.json", "input.plumed"]
+        elif self.work_path.name == "02.fp":
+            input_names += ["INCAR", "POSCAR", "KPOINTS", "POTCAR"]
+        for name in input_names:
+            input_file = directory / name
+            if input_file.is_file():
+                digest.update(input_file.read_bytes())
         keys = []
         for command in self._steps():
             digest.update(b"\0" + command.encode())
@@ -172,7 +178,7 @@ class LocalSubmission:
                 temporary = shlex.quote(str(progress / f"{index:03d}.tmp"))
                 lines.append(f"echo 'DP-GEN command {index + 1}: started'")
                 name = "command"
-                if index < len(self.commands):
+                if self.work_path.name == "00.train" and index < len(self.commands):
                     name = {0: "train", 1: "freeze", 2: "compress"}.get(
                         index, "command"
                     )
@@ -224,14 +230,7 @@ class LocalSubmission:
                             break
                         group = free.pop(0)
                         directory = self.work_path / task
-                        checkpoint_directory = (
-                            directory if self.work_path.name == "00.train" else None
-                        )
-                        resume, keys = (
-                            self._resume_state(directory)
-                            if checkpoint_directory
-                            else (0, [None] * len(self._steps()))
-                        )
+                        resume, keys = self._resume_state(directory)
                         if resume == len(keys):
                             completed += 1
                             free.append(group)
@@ -260,7 +259,7 @@ class LocalSubmission:
                             [
                                 "bash",
                                 "-c",
-                                self._script(group, checkpoint_directory, resume, keys),
+                                self._script(group, directory, resume, keys),
                             ],
                             cwd=directory,
                             stdin=subprocess.DEVNULL,
