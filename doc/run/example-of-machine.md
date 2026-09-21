@@ -156,8 +156,24 @@ avoid oversubscribing the allocation when running concurrent tasks.
 
 On a task failure or Ctrl-C, the executor terminates active local process groups
 and does not advance the workflow record. Restart using the same command:
-completed stages are skipped using `record.dpgen`, while an interrupted stage
-is executed again, using application checkpoints where the existing workflow
-supports them. No independent per-task completion cache is maintained.
+completed stages are skipped using `record.dpgen`. Training tasks record each
+successful command in `.dpgen-local-progress` inside the model directory. If
+freeze fails after training succeeds, the next launch skips training and retries
+freeze, then compression if enabled. Fully completed models are skipped. Changing
+`input.json` or an earlier command invalidates the affected completion records.
+Environment changes do not invalidate successful training, allowing a freeze
+environment problem to be fixed without retraining. If you intentionally replace
+training data or remove generated outputs, remove the model's
+`.dpgen-local-progress` directory to force its commands to execute again.
+Runs made before this tracking was added have no success records and use the
+existing training checkpoint restart behavior. Exploration and labeling retry
+an interrupted stage using the existing application restart behavior.
 
 Without `--gpus`, existing batch submission behavior is unchanged.
+
+Interactive progress logs identify the iteration and stage, the training model
+ID or exploration/labeling system and task IDs, and the assigned GPU IDs. Task
+starts include the log path; completions include elapsed time and stage progress.
+Exploration lists the model ensemble shared by its tasks. System IDs correspond
+to `sys_configs` indices. Tasks still running report their status every 60 seconds.
+Failures include the exit code and log paths.
