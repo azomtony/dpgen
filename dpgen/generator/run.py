@@ -60,6 +60,7 @@ from dpgen.generator.lib.make_calypso import (
     _make_model_devi_buffet,
     _make_model_devi_native_calypso,
 )
+from dpgen.generator.lib.model import is_dpa4c, prepare_training_backend
 from dpgen.generator.lib.parse_calypso import (
     _parse_calypso_dis_mtx,
     _parse_calypso_input,
@@ -127,7 +128,7 @@ run_opt_file = os.path.join(ROOT_PATH, "generator/lib/calypso_run_opt.py")
 
 def _get_model_suffix(jdata) -> str:
     """Return the model suffix based on the backend."""
-    if jdata.get("finetune_model_type") == "dpa4c":
+    if is_dpa4c(jdata):
         return ".pt2"
     mlp_engine = jdata.get("mlp_engine", "dp")
     if mlp_engine == "dp":
@@ -798,7 +799,25 @@ def run_train_dp(iter_index, jdata, mdata):
 
     train_command = mdata.get("train_command", "dp").strip()
     # assert train_command == "dp", "The 'train_command' should be 'dp'"     # the tests should be updated to run this command
-    if suffix == ".pth":
+    if is_dpa4c(jdata):
+        from dpgen.generator.finetune import (
+            _get_compress_command,
+            _get_freeze_command,
+            _get_train_command,
+        )
+
+        if {"--pt", "--jax"}.intersection(shlex.split(train_command)):
+            raise ValueError("DPA4C train_command requires --pt-expt, not --pt or --jax")
+        dpa4c_jdata = dict(jdata, finetune_model_type="dpa4c")
+        train_command = _get_train_command(dpa4c_jdata, mdata)
+        if (
+            training_init_frozen_model is not None
+            or training_finetune_model is not None
+        ):
+            raise ValueError(
+                "Use dpgen finetune for DPA4C foundation/frozen-model initialization"
+            )
+    elif suffix == ".pth":
         train_command += " --pt"
     elif suffix == ".savedmodel":
         train_command += " --jax"
@@ -826,7 +845,7 @@ def run_train_dp(iter_index, jdata, mdata):
         assert train_command
         extra_flags = ""
         init_flag = ""
-        if jdata.get("dp_train_skip_neighbor_stat", False):
+        if jdata.get("dp_train_skip_neighbor_stat", False) or is_dpa4c(jdata):
             extra_flags += " --skip-neighbor-stat"
         if training_init_model:
             init_flag = " --init-model old/model.ckpt"
@@ -837,7 +856,7 @@ def run_train_dp(iter_index, jdata, mdata):
         command = f"{train_command} train {train_input_file}{extra_flags}"
         if suffix == ".pb":
             ckpt_suffix = ".index"
-        elif suffix == ".pth":
+        elif suffix in {".pth", ".pt2"}:
             ckpt_suffix = ".pt"
         elif suffix == ".savedmodel":
             ckpt_suffix = ".jax"
@@ -846,10 +865,18 @@ def run_train_dp(iter_index, jdata, mdata):
         command = f"{{ if [ ! -f model.ckpt{ckpt_suffix} ]; then {command}{init_flag}; else {command} --restart model.ckpt; fi }}"
         command = f"/bin/sh -c {shlex.quote(command)}"
         commands.append(command)
-        command = f"{train_command} freeze"
+        command = (
+            _get_freeze_command(dpa4c_jdata, train_command)
+            if is_dpa4c(jdata)
+            else f"{train_command} freeze"
+        )
         commands.append(command)
         if jdata.get("dp_compress", False):
-            commands.append(f"{train_command} compress")
+            commands.append(
+                _get_compress_command(dpa4c_jdata, train_command)
+                if is_dpa4c(jdata)
+                else f"{train_command} compress"
+            )
     else:
         raise RuntimeError(
             "DP-GEN currently only supports for DeePMD-kit 1.x to 3.x version!"
@@ -876,7 +903,7 @@ def run_train_dp(iter_index, jdata, mdata):
                 os.path.join("old", "model.ckpt.index"),
                 os.path.join("old", "model.ckpt.data-00000-of-00001"),
             ]
-        elif suffix == ".pth":
+        elif suffix in {".pth", ".pt2"}:
             forward_files += [os.path.join("old", "model.ckpt.pt")]
         elif suffix == ".savedmodel":
             forward_files += [os.path.join("old", "model.ckpt.jax")]
@@ -892,7 +919,11 @@ def run_train_dp(iter_index, jdata, mdata):
         "checkpoint",
     ]
     if jdata.get("dp_compress", False):
-        backward_files.append(f"frozen_model_compressed{suffix}")
+        backward_files.append(
+            f"compressed_model{suffix}"
+            if is_dpa4c(jdata)
+            else f"frozen_model_compressed{suffix}"
+        )
 
     if suffix == ".pb":
         backward_files += [
@@ -900,7 +931,7 @@ def run_train_dp(iter_index, jdata, mdata):
             "model.ckpt.index",
             "model.ckpt.data-00000-of-00001",
         ]
-    elif suffix == ".pth":
+    elif suffix in {".pth", ".pt2"}:
         backward_files += ["model.ckpt.pt"]
     elif suffix == ".savedmodel":
         backward_files += ["model.ckpt.jax"]
@@ -985,7 +1016,7 @@ def post_train_dp(iter_index, jdata, mdata):
     for ii in range(numb_models):
         model_name = f"frozen_model{suffix}"
         if jdata.get("dp_compress", False):
-            if jdata.get("finetune_model_type") == "dpa4c":
+            if is_dpa4c(jdata):
                 model_name = f"compressed_model{suffix}"
             else:
                 model_name = f"frozen_model_compressed{suffix}"
@@ -1187,7 +1218,7 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
 
     lmp_d3 = jdata.get("lmp_d3", {})
     d3_enabled = lmp_d3.get("enable", False) if lmp_d3 else False
-    dpa4c_enabled = jdata.get("finetune_model_type") == "dpa4c"
+    dpa4c_enabled = is_dpa4c(jdata)
 
     if not d3_enabled and not dpa4c_enabled:
         return lmp_lines
@@ -1212,7 +1243,9 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
                 f"pair_coeff      * * dispersion/d3 {type_map_str}\n",
             )
         else:
-            lmp_lines.insert(pair_style_idx + 1, f"pair_coeff      * * {type_map_str}\n")
+            lmp_lines.insert(
+                pair_style_idx + 1, f"pair_coeff      * * {type_map_str}\n"
+            )
     else:
         if d3_enabled:
             # Replace existing pair_coeff with D3 version
@@ -1229,7 +1262,7 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
 
 def revise_lmp_input_atom_modify(lmp_lines, jdata=None):
     """Add atom map support required by DPA4C LAMMPS inference."""
-    if jdata is None or jdata.get("finetune_model_type") != "dpa4c":
+    if not is_dpa4c(jdata):
         return lmp_lines
 
     for line in lmp_lines:
@@ -2236,7 +2269,7 @@ def run_md_model_devi(iter_index, jdata, mdata):
     model_devi_engine = jdata.get("model_devi_engine", "lammps")
     if model_devi_engine == "lammps":
         nbeads = jdata["model_devi_jobs"][iter_index].get("nbeads")
-        dpa4c_enabled = jdata.get("finetune_model_type") == "dpa4c"
+        dpa4c_enabled = is_dpa4c(jdata)
         fresh_command = _format_lammps_model_devi_command(
             model_devi_exec, 0, nbeads=nbeads, dpa4c_enabled=dpa4c_enabled
         )
@@ -5178,7 +5211,7 @@ def set_version(mdata):
 
 
 def run_iter(param_file, machine_file):
-    jdata = load_file(param_file)
+    jdata = prepare_training_backend(load_file(param_file))
     mdata = load_file(machine_file)
 
     jdata_arginfo = run_jdata_arginfo()

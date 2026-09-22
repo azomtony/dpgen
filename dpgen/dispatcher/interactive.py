@@ -212,7 +212,7 @@ class LocalSubmission:
             models = sorted(
                 p.name
                 for p in self.work_path.glob("graph*")
-                if p.suffix in {".pb", ".pt", ".pth"}
+                if p.suffix in {".pb", ".pt", ".pth", ".pt2"}
             )
             if models:
                 dlog.info("%s | model ensemble: %s", stage, ", ".join(models))

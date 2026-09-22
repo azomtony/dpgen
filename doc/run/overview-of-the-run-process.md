@@ -63,3 +63,38 @@ DP-GEN identifies the stage of the run process by a record file, record.dpgen, w
 0,1,2 correspond to make_train, run_train, post_train. DP-GEN will write scripts in make_train, run the task by specific machine in run_train and collect result in post_train. The records for model_devi and fp stage follow similar rules.
 
 If the process of DP-GEN stops for some reasons, DP-GEN will automatically recover the main process by record.dpgen. You may also change it manually for your purpose, such as removing the last iterations and recovering from one checkpoint. When re-running dpgen, the process will start from the stage that the last line record.
+
+## Training DPA4C models from scratch
+
+`dpgen run` recognizes DPA4C from
+`default_training_param.model.descriptor.type = "dpa4c"`. Supply your complete
+DeePMD DPA4C model/training configuration under `default_training_param` and your
+system's element list in `type_map`. No foundation checkpoint or
+`finetune_model_type` setting is required. The PyTorch backend is selected when
+`train_backend` is omitted; if supplied, it must be `"pytorch"`.
+
+Use DeePMD-kit with the experimental PyTorch DPA4C backend and a matching LAMMPS
+installation. Set `deepmd_version` to your installed version (for example `"3.2"`)
+and `train.command` to `"dp --pt-expt"` in `machine.json`. If the command is simply
+`"dp"`, DP-GEN adds `--pt-expt`. Conflicting backend flags are rejected.
+
+```sh
+dpgen run param.json machine.json --gpus 0 1 2 3
+```
+
+The regular workflow generates independently seeded models using your system's
+type map, trains with `--skip-neighbor-stat`, and restarts interrupted training
+from `model.ckpt.pt`. Existing `training_init_model`/`training_reuse_iter` options
+can initialize subsequent training from previous checkpoints. Training from
+scratch does not use `--finetune` or `--use-pretrain-script`.
+
+Freezing uses `freeze -c model.ckpt.pt -o frozen_model --lower-kind graph`.
+When `dp_compress` is enabled, compression produces `compressed_model.pt2`.
+Exploration uses the resulting `graph.NNN.pt2` links, atom mapping, and explicit
+element names in the LAMMPS `pair_coeff` command. Interactive command environment
+overrides and completion tracking also apply. Omit `--gpus` to use the existing
+batch dispatcher with the same DPA4C command generation.
+
+For foundation-model fine-tuning, continue to use `dpgen finetune` and its DPA4C
+configuration. Initialization from frozen/foundation models through the regular
+DPA4C training path is rejected; use that dedicated fine-tuning workflow instead.
