@@ -497,6 +497,8 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
     else:
         cwd = os.getcwd()
         trans_comm_data = ["data.hdf5"]
+    if jdata.get("validation_fraction", 0):
+        trans_comm_data.append("data.validation")
     trans_comm_data = list(set(trans_comm_data))
     os.chdir(cwd)
 

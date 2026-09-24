@@ -98,3 +98,46 @@ batch dispatcher with the same DPA4C command generation.
 For foundation-model fine-tuning, continue to use `dpgen finetune` and its DPA4C
 configuration. Initialization from frozen/foundation models through the regular
 DPA4C training path is rejected; use that dedicated fine-tuning workflow instead.
+
+## Automatic validation holdout
+
+For both `run` and `finetune`, add these top-level options to `param.json`:
+
+```json
+"validation_fraction": 0.1,
+"validation_seed": 42
+```
+
+No machine-file change is needed. Zero (the default) disables splitting. The
+fraction must be less than one. The workflow generates `training_data` and
+`validation_data` in every model's input. Do not also provide explicit
+`default_training_param.training.validation_data` when using this option.
+DeePMD-kit 2.x or newer input format is required.
+
+Each dataset reserves a seeded, contiguous block of approximately the requested
+fraction of frames (rounded up, while retaining at least one training frame).
+Single-frame datasets remain training-only with a warning; if no validation
+frames can be reserved, preparation fails. All committee members share the same
+split. A contiguous block reduces interleaving of neighboring frames, but it is
+not a trajectory-aware or independent-structure split. Use curated separate
+validation data when stronger separation is needed.
+
+The original datasets remain unchanged. Persistent split data and frame indices
+are stored in `.dpgen-validation` in the workflow root. Preserve that directory
+across restarts and iterations. Reused sources retain their assignments; newly
+labeled datasets get their own split. Changed source contents, fraction, or seed
+are rejected for an existing cached source: use a fresh workflow directory for
+such changes. Per-iteration copies in `00.train/data.validation` are forwarded
+by the batch dispatcher, including when `one_h5` combines the training data.
+
+Validation uses batch size one and up to ten sampled validation batches per
+display interval, controlled by the existing `training.disp_freq`. Thus it uses
+a fixed held-out pool, not a full exhaustive validation pass at every report.
+Training batch sizes are capped to the remaining frame counts when specified as
+integers or lists. Other training, loss, and model settings are unchanged.
+
+Enable this in a fresh workflow, with models that have not trained on the reserved
+frames. Adding a split after training does not undo earlier exposure. Editing
+`param.json` during an interrupted training stage does not regenerate existing
+`input.json` files. No changes to batch size or learning rate are required merely
+to enable validation.

@@ -299,6 +299,9 @@ def make_train(iter_index, jdata, mdata):
 
 
 def make_train_dp(iter_index, jdata, mdata):
+    from dpgen.generator.lib.validation import validation_options
+
+    validation_options(jdata)
     # load json param
     # train_param = jdata['train_param']
     train_input_file = default_train_input_file
@@ -708,6 +711,9 @@ def make_train_dp(iter_index, jdata, mdata):
             )
     # Copy user defined forward files
     symlink_user_forward_files(mdata=mdata, task_type="train", work_path=work_path)
+    from dpgen.generator.lib.validation import make_validation_split
+
+    make_validation_split(input_files, work_path, jdata)
     # HDF5 format for training data
     if jdata.get("one_h5", False):
         convert_training_data_to_hdf5(input_files, os.path.join(work_path, "data.hdf5"))
@@ -960,6 +966,8 @@ def run_train_dp(iter_index, jdata, mdata):
     else:
         cwd = os.getcwd()
         trans_comm_data = ["data.hdf5"]
+    if jdata.get("validation_fraction", 0):
+        trans_comm_data.append("data.validation")
     # remove duplicated files
     trans_comm_data = list(set(trans_comm_data))
     os.chdir(cwd)

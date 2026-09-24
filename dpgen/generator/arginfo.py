@@ -137,6 +137,20 @@ def training_args_dp() -> list[Argument]:
 
     return [
         Argument(
+            "validation_fraction",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc="Fraction held out per dataset as a reproducible contiguous block. Zero disables automatic splitting.",
+        ),
+        Argument(
+            "validation_seed",
+            int,
+            optional=True,
+            default=42,
+            doc="Seed for the persistent validation split shared by all models. Keep unchanged across iterations.",
+        ),
+        Argument(
             "train_backend",
             str,
             optional=True,
