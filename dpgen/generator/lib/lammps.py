@@ -7,7 +7,7 @@ import numpy as np
 import scipy.constants as pc
 from packaging.version import Version
 
-from dpgen.generator.lib.model import is_dpa4c
+from dpgen.generator.lib.model import uses_pt2
 
 
 def _sample_sphere():
@@ -63,7 +63,7 @@ def make_lammps_input(
         ret += "variable        ibead           uloop %d pad\n" % (power - 1)  # noqa: UP031
     if nbeads is not None:
         ret += "atom_modify        map yes\n"
-    elif is_dpa4c(jdata):
+    elif uses_pt2(jdata):
         ret += "atom_modify     map yes\n"
     ret += "variable        THERMO_FREQ     equal %d\n" % trj_freq  # noqa: UP031
     ret += "variable        DUMP_FREQ       equal %d\n" % trj_freq  # noqa: UP031
@@ -160,7 +160,7 @@ def make_lammps_input(
         type_map_str = " ".join(type_map)
         ret += "pair_coeff      * * deepmd\n"
         ret += f"pair_coeff      * * dispersion/d3 {type_map_str}\n"
-    elif is_dpa4c(jdata):
+    elif uses_pt2(jdata):
         type_map = jdata.get("type_map", [])
         type_map_str = " ".join(type_map)
         ret += f"pair_coeff      * * {type_map_str}\n"

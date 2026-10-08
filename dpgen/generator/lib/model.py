@@ -13,6 +13,23 @@ def is_dpa4c(jdata):
     )
 
 
+def is_dpa4(jdata):
+    """Recognize DPA4 fine-tuning and explicit DPA4/SeZM descriptors."""
+    if not jdata:
+        return False
+    model = jdata.get("default_training_param", {}).get("model", {})
+    return (
+        jdata.get("finetune_model_type") == "dpa4"
+        or model.get("type") == "dpa4"
+        or model.get("descriptor", {}).get("type") in {"dpa4", "sezm"}
+    )
+
+
+def uses_pt2(jdata):
+    """Identify model families deployed as compiled PyTorch archives."""
+    return is_dpa4(jdata) or is_dpa4c(jdata)
+
+
 def prepare_training_backend(jdata):
     """Select the PyTorch backend for DPA4C without changing its model definition."""
     if is_dpa4c(jdata):

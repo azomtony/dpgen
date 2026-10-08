@@ -141,3 +141,28 @@ frames. Adding a split after training does not undo earlier exposure. Editing
 `param.json` during an interrupted training stage does not regenerate existing
 `input.json` files. No changes to batch size or learning rate are required merely
 to enable validation.
+
+## Fine-tuning DPA4 foundation models
+
+Use `dpgen finetune param.json machine.json` with
+`finetune_model_type: "dpa4"`, `finetune_model` pointing to a `.pt` or `.pth`
+checkpoint, and `dp_compress: false`. One checkpoint can initialize all
+`numb_models` ensemble members. DPA4 uses the standard PyTorch backend (`dp --pt`),
+not DPA4C's experimental backend; conflicting machine `train_command` backend
+flags are rejected.
+
+Supply the checkpoint's matching complete model configuration under
+`default_training_param.model`, including its full `type_map`, DPA4/SeZM
+`descriptor`, and `fitting_net`. DP-GEN preserves the model's element ordering
+while using the top-level system `type_map` for exploration. All system elements
+must occur in the model element map. Training data paths and ensemble seeds are
+assigned by DP-GEN. Tune learning rate and training steps for your target data.
+
+The workflow fine-tunes from the foundation in iteration zero and initializes
+from the previous iteration's checkpoints thereafter, unless
+`finetune_model_source: "foundation"` is selected. Export produces `.pt2` archives
+for exploration, which requires a compatible DeePMD/LAMMPS installation. DPA4
+compression is unsupported. The supported path is ordinary energy/force
+full-model fine-tuning; LoRA and spin workflows have not been validated.
+
+See `examples/run/dpa4-finetune/README.md` for a configuration recipe.

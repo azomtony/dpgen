@@ -60,7 +60,7 @@ from dpgen.generator.lib.make_calypso import (
     _make_model_devi_buffet,
     _make_model_devi_native_calypso,
 )
-from dpgen.generator.lib.model import is_dpa4c, prepare_training_backend
+from dpgen.generator.lib.model import is_dpa4c, prepare_training_backend, uses_pt2
 from dpgen.generator.lib.parse_calypso import (
     _parse_calypso_dis_mtx,
     _parse_calypso_input,
@@ -128,7 +128,7 @@ run_opt_file = os.path.join(ROOT_PATH, "generator/lib/calypso_run_opt.py")
 
 def _get_model_suffix(jdata) -> str:
     """Return the model suffix based on the backend."""
-    if is_dpa4c(jdata):
+    if uses_pt2(jdata):
         return ".pt2"
     mlp_engine = jdata.get("mlp_engine", "dp")
     if mlp_engine == "dp":
@@ -498,7 +498,8 @@ def make_train_dp(iter_index, jdata, mdata):
         # 1.x
         jinput["training"]["systems"] = init_data_sys
         jinput["training"]["batch_size"] = init_batch_size
-        jinput["model"]["type_map"] = jdata["type_map"]
+        if jdata.get("finetune_model_type") != "dpa4":
+            jinput["model"]["type_map"] = jdata["type_map"]
         # electron temperature
         if use_ele_temp == 0:
             pass
@@ -521,7 +522,8 @@ def make_train_dp(iter_index, jdata, mdata):
             isinstance(old_batch_size, str) and old_batch_size.startswith("mixed:")
         ):
             jinput["training"]["training_data"]["batch_size"] = init_batch_size
-        jinput["model"]["type_map"] = jdata["type_map"]
+        if jdata.get("finetune_model_type") != "dpa4":
+            jinput["model"]["type_map"] = jdata["type_map"]
         # electron temperature
         if use_ele_temp == 0:
             pass
@@ -613,10 +615,10 @@ def make_train_dp(iter_index, jdata, mdata):
             # 1.x
             if "descriptor" not in jinput["model"]:
                 pass
-            elif jinput["model"]["descriptor"]["type"] == "hybrid":
+            elif jinput["model"]["descriptor"].get("type") == "hybrid":
                 for desc in jinput["model"]["descriptor"]["list"]:
                     desc["seed"] = random.randrange(sys.maxsize) % (2**32)
-            elif jinput["model"]["descriptor"]["type"] == "loc_frame":
+            elif jinput["model"]["descriptor"].get("type") == "loc_frame":
                 pass
             else:
                 jinput["model"]["descriptor"]["seed"] = random.randrange(
@@ -1226,9 +1228,9 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
 
     lmp_d3 = jdata.get("lmp_d3", {})
     d3_enabled = lmp_d3.get("enable", False) if lmp_d3 else False
-    dpa4c_enabled = is_dpa4c(jdata)
+    pt2_enabled = uses_pt2(jdata)
 
-    if not d3_enabled and not dpa4c_enabled:
+    if not d3_enabled and not pt2_enabled:
         return lmp_lines
 
     type_map = jdata.get("type_map", [])
@@ -1269,8 +1271,8 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
 
 
 def revise_lmp_input_atom_modify(lmp_lines, jdata=None):
-    """Add atom map support required by DPA4C LAMMPS inference."""
-    if not is_dpa4c(jdata):
+    """Add atom map support required by compiled DPA4-family inference."""
+    if not uses_pt2(jdata):
         return lmp_lines
 
     for line in lmp_lines:

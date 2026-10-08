@@ -131,7 +131,7 @@ def training_args_dp() -> list[Argument]:
     doc_training_init_frozen_model = "At interation 0, initilize the model parameters from the given frozen models. Number of element should be equal to numb_models."
     doc_training_finetune_model = "At interation 0, finetune the model parameters from the given frozen models. Number of element should be equal to numb_models."
     doc_finetune_model_type = (
-        "Fine-tune model type. Use 'dp3' for the default PyTorch backend, or "
+        "Fine-tune model type. Use 'dp3' or 'dpa4' for the PyTorch backend, or "
         "'dpa4c' for DPA4C foundation models with the pt-expt backend."
     )
 
