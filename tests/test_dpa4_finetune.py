@@ -36,10 +36,26 @@ class TestDPA4Finetune(unittest.TestCase):
         )
         data["default_training_param"]["model"].update(
             type_map=["H", "Mg", "Al"],
-            type="dpa4",
+            type="SeZM",
             descriptor={"rcut": 6.0},
         )
         return data
+
+    def test_released_sezm_model_aliases(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:
+            for alias in ("SeZM", "sezm", "DPA4", "dpa4"):
+                with self.subTest(alias=alias):
+                    data = self.data(checkpoint.name)
+                    data["default_training_param"]["model"]["type"] = alias
+                    prepared = prepare_finetune_jdata(data)
+                    self.assertEqual(
+                        prepared["default_training_param"]["model"]["type"], alias
+                    )
+                    self.assertTrue(
+                        is_dpa4(
+                            {"default_training_param": data["default_training_param"]}
+                        )
+                    )
 
     def test_validation_and_backend(self):
         with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint:

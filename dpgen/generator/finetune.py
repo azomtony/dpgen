@@ -168,14 +168,18 @@ def prepare_finetune_jdata(jdata):
         if (
             not model.get("type_map")
             or not model.get("descriptor")
-            or (not model.get("fitting_net") and model.get("type") != "dpa4")
+            or (
+                not model.get("fitting_net")
+                and model.get("type") not in {"dpa4", "DPA4", "sezm", "SeZM"}
+            )
         ):
             raise RuntimeError(
                 "DPA4 requires the checkpoint's complete model configuration "
                 "(type_map, descriptor, fitting_net) in default_training_param.model."
             )
         if model["descriptor"].get(
-            "type", "sezm" if model.get("type") == "dpa4" else None
+            "type",
+            "sezm" if model.get("type") in {"dpa4", "DPA4", "sezm", "SeZM"} else None,
         ) not in {"dpa4", "sezm"}:
             raise RuntimeError("DPA4 requires a 'dpa4' or 'sezm' descriptor.")
         if not set(jdata.get("type_map", [])).issubset(model["type_map"]):

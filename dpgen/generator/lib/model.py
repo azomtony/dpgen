@@ -20,7 +20,7 @@ def is_dpa4(jdata):
     model = jdata.get("default_training_param", {}).get("model", {})
     return (
         jdata.get("finetune_model_type") == "dpa4"
-        or model.get("type") == "dpa4"
+        or model.get("type") in {"dpa4", "DPA4", "sezm", "SeZM"}
         or model.get("descriptor", {}).get("type") in {"dpa4", "sezm"}
     )
 
