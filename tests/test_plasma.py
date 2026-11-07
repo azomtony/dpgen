@@ -758,6 +758,32 @@ class TestPlasma(unittest.TestCase):
             normalized["model_devi_jobs"][0]["selection"]["validation_fraction"], 0.1
         )
 
+    def test_generated_sampling_uses_lammps_scalar_clamp(self):
+        config = dict(
+            plasma.DEFAULTS,
+            temp=293,
+            seed=1,
+            trj_freq=10,
+            stop_factor=2,
+            f_hi=0.3,
+            v_hi=1e10,
+            models=["a", "b"],
+        )
+        for phase, frequency in (("eq", config["eq_trj_freq"]), ("exposure", 10)):
+            state = worker.initial_state(config)
+            state.update(phase=phase, step=975)
+            text = worker.block_input(
+                config, state, None, "checkpoints/test", None, 5.0, 0
+            )
+            self.assertNotIn("equal min(", text)
+            self.assertNotIn("equal max(", text)
+            self.assertIn("variable sample_steps equal v_checkpoint_end-step", text)
+            self.assertIn(
+                f'if "${{sample_steps}} > {frequency}" then "variable sample_steps equal {frequency}"',
+                text,
+            )
+            self.assertIn("$(step) >= ${checkpoint_end}", text)
+
     def test_checkpoint_targets_do_not_restart_event_interval(self):
         config = dict(
             plasma.DEFAULTS,

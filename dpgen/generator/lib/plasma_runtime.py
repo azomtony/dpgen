@@ -277,8 +277,9 @@ print "$(time:%.17g)" file {p}/arrival.txt screen no
 variable checkpoint_end internal $(step+{config["checkpoint_freq"]}:%.0f)
 variable plasma_abort internal 0
 label plasma_sample
-if "$(time) >= {target:.17g}" then "jump SELF plasma_block_done"
-variable sample_steps equal min({frequency},v_checkpoint_end-step)
+if "$(time) >= {target:.17g} || $(step) >= ${{checkpoint_end}}" then "jump SELF plasma_block_done"
+variable sample_steps equal v_checkpoint_end-step
+if "${{sample_steps}} > {frequency}" then "variable sample_steps equal {frequency}"
 run ${{sample_steps}} post no
 shell python plasma_runtime.py --monitor {p}
 include {p}/control.lammps
