@@ -143,12 +143,21 @@ class TestDPA4Finetune(unittest.TestCase):
                 data["model_devi_jobs"] = [{}, {}]
                 with patch("dpgen.generator.run._check_empty_iter", return_value=False):
                     _make_train_finetune(1, data, machine, False)
+                # A lack of FP data normally copies the model. Force training
+                # must replace those symlinks with fresh tasks, preserving a backup.
+                with patch("dpgen.generator.run._check_empty_iter", return_value=True):
+                    _make_train_finetune(1, data, machine, False)
+                    self.assertTrue(Path("iter.000001/00.train/copied").is_file())
+                    _make_train_finetune(1, data, machine, False, force_train=True)
+                self.assertFalse(Path("iter.000001/00.train/copied").exists())
+                self.assertTrue(Path("iter.000001/00.train.bk001/000").is_symlink())
                 next_task = Path("iter.000001/00.train/000")
                 self.assertTrue((next_task / "old/model.ckpt.pt").is_file())
                 generated = json.loads((next_task / "input.json").read_text())
                 self.assertEqual(generated["model"]["type_map"], model["type_map"])
+                data["model_devi_jobs"][1]["skip_train"] = True
                 with patch("dpgen.generator.run._check_empty_iter", return_value=False):
-                    _make_train_finetune(2, data, machine, True)
+                    _make_train_finetune(2, data, machine, True, force_train=True)
                 self.assertTrue(Path("iter.000002/00.train/000/old/init.pt").is_file())
             finally:
                 os.chdir(original)

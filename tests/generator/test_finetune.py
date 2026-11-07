@@ -15,11 +15,27 @@ from dpgen.generator.finetune import (
     _get_frozen_model_suffix,
     _get_init_model_name,
     _get_train_command,
+    _resume_forced_training,
     prepare_finetune_jdata,
 )
 
 
 class TestFinetune(unittest.TestCase):
+    def test_force_resume_only_rewinds_copied_training(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record = str(Path(tmpdir) / "record.dpgen")
+            with patch("dpgen.generator.finetune.os.path.isfile", return_value=True):
+                self.assertEqual(_resume_forced_training([5, 2], record, False), [5, 2])
+                self.assertFalse(Path(record).exists())
+                self.assertEqual(_resume_forced_training([5, 2], record, True), [5, -1])
+                self.assertEqual(Path(record).read_text().split(), ["5", "-1"])
+                self.assertEqual(_resume_forced_training([5, 8], record, True), [5, 8])
+            with patch("dpgen.generator.finetune.os.path.isfile", return_value=False):
+                self.assertEqual(_resume_forced_training([5, 2], record, True), [5, 2])
+
     def test_prepare_finetune_jdata_uses_pytorch_models(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             models = []
@@ -145,8 +161,7 @@ class TestFinetune(unittest.TestCase):
         )
         self.assertEqual(
             _get_freeze_command(prepared, "dp --pt-expt"),
-            "dp --pt-expt freeze -c model.ckpt.pt -o frozen_model "
-            "--lower-kind graph",
+            "dp --pt-expt freeze -c model.ckpt.pt -o frozen_model --lower-kind graph",
         )
         self.assertEqual(
             _get_compress_command(prepared, "dp --pt-expt"),

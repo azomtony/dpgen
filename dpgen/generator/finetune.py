@@ -365,7 +365,7 @@ def _get_init_model_name(jdata):
     return f"init{jdata.get('finetune_model_suffix', '.pth')}"
 
 
-def _make_train_finetune(iter_index, jdata, mdata, link_foundation):
+def _make_train_finetune(iter_index, jdata, mdata, link_foundation, force_train=False):
     from dpgen.generator.lib.utils import make_iter_name
     from dpgen.generator.run import (
         default_train_input_file,
@@ -380,7 +380,7 @@ def _make_train_finetune(iter_index, jdata, mdata, link_foundation):
     if model.get("descriptor") == {}:
         model.pop("descriptor")
 
-    make_train(iter_index, make_jdata, mdata)
+    make_train(iter_index, make_jdata, mdata, force_train=force_train)
     if link_foundation:
         _link_finetune_models(iter_index, jdata)
 
@@ -563,7 +563,24 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
     submission.run_submission()
 
 
-def run_finetune_iter(param_file, machine_file):
+def _resume_forced_training(iter_rec, record, force_train):
+    from dpgen.generator.lib.utils import make_iter_name, record_iter
+
+    # Only rewind copied training before exploration: completed downstream work
+    # must not be silently invalidated by a new invocation.
+    if force_train and 0 <= iter_rec[1] <= 2:
+        copied = os.path.join(make_iter_name(iter_rec[0]), "00.train", "copied")
+        if os.path.isfile(copied):
+            dlog.info(
+                "Force training: resume copied iteration %06d from task 00", iter_rec[0]
+            )
+            iter_rec[1] = -1
+            record_iter(record, *iter_rec)
+
+    return iter_rec
+
+
+def run_finetune_iter(param_file, machine_file, force_train=False):
     """Run fine-tuning followed by the existing exploration and FP stages."""
     from dpgen.generator.arginfo import run_jdata_arginfo
     from dpgen.generator.lib.utils import log_iter, make_iter_name, record_iter
@@ -656,6 +673,8 @@ def run_finetune_iter(param_file, machine_file):
             raise ValueError("There should not be blank lines in record.dpgen.")
         dlog.info("continue from iter %03d task %02d" % (iter_rec[0], iter_rec[1]))  # noqa: UP031
 
+    iter_rec = _resume_forced_training(iter_rec, record, force_train)
+
     cont = True
     ii = -1
     while cont:
@@ -676,12 +695,13 @@ def run_finetune_iter(param_file, machine_file):
                     jdata,
                     mdata,
                     finetune_model_source == "foundation" or ii == 0,
+                    force_train=force_train,
                 )
             elif jj == 1:
                 log_iter("run_train", ii, jj)
                 if finetune_model_source == "foundation" or ii == 0:
                     _run_train_pytorch_with_init(ii, jdata, mdata, True)
-                elif _uses_pretrain_script(jdata):
+                elif is_dpa4(jdata) or _uses_pretrain_script(jdata):
                     _run_train_pytorch_with_init(ii, jdata, mdata, False)
                 else:
                     run_train(ii, jdata, mdata)
@@ -722,7 +742,11 @@ def gen_finetune(args):
         from dpgen.dispatcher.interactive import interactive_execution
 
         with interactive_execution(args):
-            run_finetune_iter(args.PARAM, args.MACHINE)
+            run_finetune_iter(
+                args.PARAM,
+                args.MACHINE,
+                force_train=getattr(args, "force_train", False),
+            )
         dlog.info("finished")
 
 
@@ -733,5 +757,6 @@ def _main():
         "MACHINE", type=str, help="The settings of the machine running the generator"
     )
     parser.add_argument("-d", "--debug", action="store_true", help="log debug info")
+    parser.add_argument("--force-train", action="store_true")
     args = parser.parse_args()
     gen_finetune(args)

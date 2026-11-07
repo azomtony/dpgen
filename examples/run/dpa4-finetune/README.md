@@ -43,3 +43,12 @@ energy/force full-model fine-tuning; spin and LoRA workflows are not validated.
 
 See the [DeePMD DPA4 guide](https://docs.deepmodeling.com/projects/deepmd/en/latest/model/dpa4.html)
 for matching checkpoint configurations, backend requirements, and export details.
+
+When adding initial training data, use `dpgen finetune param.json machine.json
+--force-train` to train even if the preceding FP stage produced insufficient
+new data or its exploration entry sets `skip_train`. This applies to training
+stages reached during this invocation. If resuming a copied iteration before
+exploration (recorded task 00–02), it restarts that iteration at training
+preparation and backs up the existing `00.train` directory. Completed exploration
+and FP stages are not rewound. The flag does not extend `model_devi_jobs`.
+Without the flag, the usual copy/skip behavior is unchanged.

@@ -290,15 +290,15 @@ def dump_to_deepmd_raw(dump, deepmd_raw, type_map, fmt="gromacs/gro", charge=Non
             f.write(str(charge))
 
 
-def make_train(iter_index, jdata, mdata):
+def make_train(iter_index, jdata, mdata, force_train=False):
     mlp_engine = jdata.get("mlp_engine", "dp")
     if mlp_engine == "dp":
-        return make_train_dp(iter_index, jdata, mdata)
+        return make_train_dp(iter_index, jdata, mdata, force_train=force_train)
     else:
         raise ValueError(f"Unsupported engine: {mlp_engine}")
 
 
-def make_train_dp(iter_index, jdata, mdata):
+def make_train_dp(iter_index, jdata, mdata, force_train=False):
     from dpgen.generator.lib.validation import validation_options
 
     validation_options(jdata)
@@ -363,12 +363,17 @@ def make_train_dp(iter_index, jdata, mdata):
 
     suffix = _get_model_suffix(jdata)
     model_devi_engine = jdata.get("model_devi_engine", "lammps")
-    if iter_index > 0 and _check_empty_iter(iter_index - 1, fp_task_min):
+    if (
+        not force_train
+        and iter_index > 0
+        and _check_empty_iter(iter_index - 1, fp_task_min)
+    ):
         log_task("prev data is empty, copy prev model")
         copy_model(numb_models, iter_index - 1, iter_index, suffix)
         return
     elif (
-        model_devi_engine != "calypso"
+        not force_train
+        and model_devi_engine != "calypso"
         and iter_index > 0
         and _check_skip_train(model_devi_jobs[iter_index - 1])
     ):

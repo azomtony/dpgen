@@ -130,6 +130,11 @@ def main_parser() -> argparse.ArgumentParser:
     parser_finetune.add_argument(
         "-d", "--debug", action="store_true", help="log debug info"
     )
+    parser_finetune.add_argument(
+        "--force-train",
+        action="store_true",
+        help="Train even without new FP data or when skip_train is set; resume copied training.",
+    )
     add_interactive_args(parser_finetune)
     parser_finetune.set_defaults(func=gen_finetune)
 
