@@ -1380,6 +1380,20 @@ def make_model_devi(iter_index, jdata, mdata):
     model_devi_engine = jdata.get("model_devi_engine", "lammps")
 
     model_devi_jobs = jdata["model_devi_jobs"]
+    if jdata.get("model_devi_restart_from_last", False):
+        if (
+            model_devi_engine != "lammps"
+            or any(
+                "template" in job or job.get("nbeads") is not None
+                for job in model_devi_jobs
+            )
+            or jdata.get("use_clusters", False)
+            or jdata.get("cluster_cutoff") is not None
+        ):
+            raise ValueError(
+                "model_devi_restart_from_last supports native classical LAMMPS "
+                "exploration without cluster selection only."
+            )
     if model_devi_engine != "calypso":
         if iter_index >= len(model_devi_jobs):
             return False
@@ -1571,7 +1585,12 @@ def make_model_devi(iter_index, jdata, mdata):
     use_plm_path = jdata.get("model_devi_plumed_path", False)
     if input_mode == "native":
         if model_devi_engine == "lammps":
-            _make_model_devi_native(iter_index, jdata, mdata, conf_systems)
+            if cur_job.get("ensemble", cur_job.get("ens")) == "plasma":
+                from dpgen.generator.lib.plasma import make_tasks
+
+                make_tasks(iter_index, jdata, conf_systems, models)
+            else:
+                _make_model_devi_native(iter_index, jdata, mdata, conf_systems)
         elif model_devi_engine == "gromacs":
             _make_model_devi_native_gromacs(iter_index, jdata, mdata, conf_systems)
         elif model_devi_engine == "amber":
@@ -1798,6 +1817,13 @@ def _make_model_devi_revmat(iter_index, jdata, mdata, conf_systems):
 
 
 def _make_model_devi_native(iter_index, jdata, mdata, conf_systems):
+    from dpgen.generator.lib.exploration_restart import (
+        previous_tasks,
+        restart_from_previous,
+    )
+
+    restart = jdata.get("model_devi_restart_from_last", False)
+    previous = previous_tasks(iter_index) if restart else {}
     model_devi_jobs = jdata["model_devi_jobs"]
     if iter_index >= len(model_devi_jobs):
         return False
@@ -1890,10 +1916,33 @@ def _make_model_devi_native(iter_index, jdata, mdata, conf_systems):
                     if not model_devi_merge_traj:
                         create_path(os.path.join(task_path, "traj"))
                     loc_conf_name = "conf.lmp"
-                    os.symlink(
-                        os.path.join(os.path.join("..", "confs"), conf_name),
-                        os.path.join(task_path, loc_conf_name),
-                    )
+                    job = {"ensemble": ensemble, "press": pp, "temps": tt}
+                    if te_f is not None or te_a is not None:
+                        job["ele_temp"] = te_f if te_f is not None else te_a
+                    if pka_e is not None:
+                        job["pka_e"] = pka_e
+                    if restart:
+                        job["source_conf"] = os.path.realpath(cc)
+                        job["restart"] = restart_from_previous(
+                            previous,
+                            iter_index,
+                            sys_idx[sys_counter],
+                            cc,
+                            job,
+                            jdata,
+                            os.path.join(task_path, loc_conf_name),
+                        )
+                        if job["restart"]["source"] == "initial":
+                            dlog.info(
+                                "Exploration restart %s uses initial structure: %s",
+                                task_path,
+                                job["restart"]["reason"],
+                            )
+                    if not restart or job["restart"]["source"] == "initial":
+                        os.symlink(
+                            os.path.join("..", "confs", conf_name),
+                            os.path.join(task_path, loc_conf_name),
+                        )
                     cwd_ = os.getcwd()
                     os.chdir(task_path)
                     try:
@@ -1922,14 +1971,6 @@ def _make_model_devi_native(iter_index, jdata, mdata, conf_systems):
                         deepmd_version=deepmd_version,
                         nbeads=nbeads,
                     )
-                    job = {}
-                    job["ensemble"] = ensemble
-                    job["press"] = pp
-                    job["temps"] = tt
-                    if te_f is not None:
-                        job["ele_temp"] = te_f
-                    if te_a is not None:
-                        job["ele_temp"] = te_a
                     job["model_devi_dt"] = model_devi_dt
                     with open("job.json", "w") as _outfile:
                         json.dump(job, _outfile, indent=4)
@@ -2245,6 +2286,11 @@ def _make_model_devi_amber(
 
 
 def run_md_model_devi(iter_index, jdata, mdata):
+    cur_job = jdata["model_devi_jobs"][iter_index]
+    if cur_job.get("ensemble", cur_job.get("ens")) == "plasma":
+        from dpgen.generator.lib.plasma import run_tasks
+
+        return run_tasks(iter_index, jdata, mdata)
     # rmdlog.info("This module has been run !")
     model_devi_exec = mdata["model_devi_command"]
 
@@ -2898,6 +2944,8 @@ def _make_fp_vasp_inner(
         return sys_lim
 
     for ss in system_index:
+        plasma_metadata = None
+        plasma_origins = []
         modd_system_glob = os.path.join(modd_path, "task." + ss + ".*")
         modd_system_task = glob.glob(modd_system_glob)
         modd_system_task.sort()
@@ -2908,8 +2956,26 @@ def _make_fp_vasp_inner(
             v_trust_lo_sys = _trust_limitation_check(int(ss), v_trust_lo)
             v_trust_hi_sys = _trust_limitation_check(int(ss), v_trust_hi)
 
+            plasma_job = jdata["model_devi_jobs"][iter_index]
+            is_plasma = plasma_job.get("ensemble", plasma_job.get("ens")) == "plasma"
             # assumed e -> v
-            if not model_devi_adapt_trust_lo:
+            if is_plasma:
+                from dpgen.generator.lib.plasma import select_frames
+
+                (
+                    fp_rest_accurate,
+                    fp_candidate,
+                    fp_rest_failed,
+                    counter,
+                    plasma_metadata,
+                ) = select_frames(
+                    modd_system_task,
+                    plasma_job,
+                    jdata,
+                    int(ss),
+                    _get_sys_wise_int(fp_task_max, int(ss), "fp_task_max"),
+                )
+            elif not model_devi_adapt_trust_lo:
                 (
                     fp_rest_accurate,
                     fp_candidate,
@@ -3007,12 +3073,21 @@ def _make_fp_vasp_inner(
 
         if fp_sum == 0:
             dlog.info(f"system {ss:s} has no fp task, maybe the model devi is nan %")
+            if plasma_metadata is not None:
+                from dpgen.generator.lib.plasma import write_selection_report
+
+                write_selection_report(
+                    work_path, int(ss), plasma_job,
+                    _get_sys_wise_int(fp_task_max, int(ss), "fp_task_max"),
+                    plasma_metadata, [],
+                )
             continue
         for cc_key, cc_value in counter.items():
             dlog.info(
                 f"system {ss:s} {cc_key:9s} : {cc_value:6d} in {fp_sum:6d} {cc_value / fp_sum * 100:6.2f} %"
             )
-        random.shuffle(fp_candidate)
+        if plasma_metadata is None:
+            random.shuffle(fp_candidate)
         if detailed_report_make_fp:
             random.shuffle(fp_rest_failed)
             random.shuffle(fp_rest_accurate)
@@ -3085,6 +3160,9 @@ def _make_fp_vasp_inner(
             numb_task = calypso_intend_fp_num
             if len(fp_candidate) < numb_task:
                 numb_task = 0
+        if plasma_metadata is not None:
+            # Explicit event budgets bypass quiet-frame accuracy and fp_task_min.
+            numb_task = len(fp_candidate)
         # ----------------------------------------------------------------------------
         dlog.info(
             f"system {ss:s} accurate_ratio: {accurate_ratio:8.4f}    thresholds: {fp_accurate_soft_threshold:6.4f} and {fp_accurate_threshold:6.4f}   eff. task min and max {fp_task_min_sys:4d} {this_fp_task_max:4d}   number of fp tasks: {numb_task:6d}"
@@ -3176,7 +3254,17 @@ def _make_fp_vasp_inner(
                         conf_sys.to("lammps/lmp", "conf.dump")
                     else:
                         os.symlink(os.path.relpath(conf_name), "conf.dump")
-                    os.symlink(os.path.relpath(job_name), "job.json")
+                    if plasma_metadata is None:
+                        os.symlink(os.path.relpath(job_name), "job.json")
+                    else:
+                        with open(job_name) as stream:
+                            frame_job = json.load(stream)
+                        frame_job["plasma_frame"] = plasma_metadata[(tt, int(ii))]
+                        with open("job.json", "w") as stream:
+                            json.dump(frame_job, stream, indent=2)
+                        from dpgen.generator.lib.plasma import log_fp_origin
+
+                        plasma_origins.append(log_fp_origin(fp_task_path, frame_job))
                 elif model_devi_engine == "gromacs":
                     os.symlink(os.path.relpath(conf_name), "conf.dump")
                     os.symlink(os.path.relpath(job_name), "job.json")
@@ -3217,6 +3305,13 @@ def _make_fp_vasp_inner(
             for pair in fp_link_files:
                 os.symlink(pair[0], pair[1])
             os.chdir(cwd)
+        if plasma_metadata is not None:
+            from dpgen.generator.lib.plasma import write_selection_report
+
+            write_selection_report(
+                work_path, int(ss), plasma_job, fp_task_max_sys,
+                plasma_metadata, plasma_origins,
+            )
         if count_bad_box > 0:
             dlog.info(
                 f"system {ss:s} skipped {count_bad_box:6d} confs with bad box, {numb_task - count_bad_box:6d} remains"
@@ -3282,7 +3377,7 @@ def _abspath_fp_incar(fp_incar):
     if isinstance(fp_incar, list):
         return [os.path.abspath(ii) for ii in fp_incar]
     if isinstance(fp_incar, dict):
-        return {str(key): os.path.abspath(value) for key, value in fp_incar.items()}
+        return {str(key): _abspath_fp_incar(value) for key, value in fp_incar.items()}
     raise TypeError("fp_incar should be a string, list, or dict")
 
 
@@ -3294,6 +3389,34 @@ def _get_fp_task_sys_idx(task_path):
     if len(task_parts) >= 3 and task_parts[0] == "task":
         return int(task_parts[1])
     return None
+
+
+def _select_incar_by_species(entry, task_path=None):
+    """Resolve an optional species-to-INCAR map using the actual FP snapshot."""
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        raise TypeError("Each fp_incar system entry should be a path or species map")
+    task = Path(task_path) if task_path is not None else Path.cwd()
+    if not task.is_dir() and task.name == Path.cwd().name:
+        # make_fp_vasp_incar already changed into the task directory, while
+        # task_path may still be relative to the workflow root.
+        task = Path.cwd()
+    poscar = task / "POSCAR"
+    system = dpdata.System(str(poscar), fmt="vasp/poscar")
+    species = sorted(
+        name for name, count in zip(system.data["atom_names"], system.data["atom_numbs"])
+        if count > 0
+    )
+    key = "-".join(species)
+    if key in entry:
+        return entry[key]
+    if "default" in entry:
+        return entry["default"]
+    raise RuntimeError(
+        f"Cannot select fp_incar for species '{key}' in {poscar}: "
+        f"provide key '{key}' or 'default' in the system's species map"
+    )
 
 
 def _select_vasp_incar_path(jdata, task_path=None):
@@ -3309,13 +3432,13 @@ def _select_vasp_incar_path(jdata, task_path=None):
             raise RuntimeError(
                 f"Cannot select fp_incar for system index {sys_idx}: only {len(fp_incar)} entries provided"
             )
-        return fp_incar[sys_idx]
+        return _select_incar_by_species(fp_incar[sys_idx], task_path)
 
     if isinstance(fp_incar, dict):
         if sys_idx is not None and str(sys_idx) in fp_incar:
-            return fp_incar[str(sys_idx)]
+            return _select_incar_by_species(fp_incar[str(sys_idx)], task_path)
         if "default" in fp_incar:
-            return fp_incar["default"]
+            return _select_incar_by_species(fp_incar["default"], task_path)
         raise RuntimeError(
             f"Cannot select fp_incar for system index {sys_idx}: provide key '{sys_idx}' or 'default'"
         )
@@ -3624,6 +3747,11 @@ def _link_fp_vasp_pp(iter_index, jdata):
 
 
 def sys_link_fp_vasp_pp(iter_index, jdata):
+    jobs = jdata.get("model_devi_jobs", [])
+    if iter_index < len(jobs) and jobs[iter_index].get("ensemble", jobs[iter_index].get("ens")) == "plasma":
+        from dpgen.generator.lib.plasma import link_potcars
+
+        return link_potcars(iter_index, jdata)
     fp_pp_path = jdata["fp_pp_path"]
     fp_pp_files = jdata["fp_pp_files"]
     fp_pp_path = os.path.abspath(fp_pp_path)
@@ -4655,6 +4783,7 @@ def post_fp_check_fail(iter_index, jdata, rfailed=None):
 
     # check fail according to the number of collected data
     sys_data = glob.glob(os.path.join(work_path, "data.*"))
+    sys_data += glob.glob(os.path.join(work_path, "validation.*"))
     sys_data.sort()
     nframe = 0
     for ii in sys_data:
@@ -4702,6 +4831,7 @@ def post_fp_vasp(iter_index, jdata, rfailed=None):
         sys_outcars.sort()
         tcount += len(sys_outcars)
         all_sys = None
+        validation_sys = None
         all_te = []
         for oo in sys_outcars:
             try:
@@ -4716,10 +4846,12 @@ def post_fp_vasp(iter_index, jdata, rfailed=None):
                     _sys = dpdata.LabeledSystem()
                     dlog.info("Failed fp path: {}".format(oo.replace("OUTCAR", "")))
             if len(_sys) == 1:
+                holdout = False
                 # save ele_temp, if any
                 if os.path.exists(oo.replace("OUTCAR", "job.json")):
                     with open(oo.replace("OUTCAR", "job.json")) as fp:
                         job_data = json.load(fp)
+                    holdout = job_data.get("plasma_frame", {}).get("validation", False)
                     if "ele_temp" in job_data:
                         assert use_ele_temp
                         ele_temp = job_data["ele_temp"]
@@ -4741,7 +4873,14 @@ def post_fp_vasp(iter_index, jdata, rfailed=None):
                             )
                         # check if ele_temp shape is correct
                         _sys.check_data()
-                if all_sys is None:
+                if holdout:
+                    if validation_sys is None:
+                        validation_sys = dpdata.MultiSystems(
+                            _sys, type_map=jdata["type_map"]
+                        )
+                    else:
+                        validation_sys.append(_sys)
+                elif all_sys is None:
                     all_sys = dpdata.MultiSystems(_sys, type_map=jdata["type_map"])
                 else:
                     all_sys.append(_sys)
@@ -4750,6 +4889,10 @@ def post_fp_vasp(iter_index, jdata, rfailed=None):
             else:
                 icount += 1
         all_te = np.array(all_te)
+        if validation_sys is not None:
+            validation_path = os.path.join(work_path, f"validation.{ss}")
+            validation_sys.to_deepmd_raw(validation_path)
+            validation_sys.to_deepmd_npy(validation_path, set_size=len(sys_outcars))
         if all_sys is not None:
             sys_data_path = os.path.join(work_path, f"data.{ss}")
             all_sys.to_deepmd_raw(sys_data_path)
@@ -5204,19 +5347,29 @@ def post_fp(iter_index, jdata):
     clean_traj = True
     if "model_devi_clean_traj" in jdata:
         clean_traj = jdata["model_devi_clean_traj"]
-    modd_path = None
-    if isinstance(clean_traj, bool):
-        iter_name = make_iter_name(iter_index)
-        if clean_traj:
-            modd_path = os.path.join(iter_name, model_devi_name)
-    elif isinstance(clean_traj, int):
-        clean_index = iter_index - clean_traj
-        if clean_index >= 0:
-            modd_path = os.path.join(make_iter_name(clean_index), model_devi_name)
+    from dpgen.generator.lib.exploration_restart import trajectory_cleanup_index
+
+    clean_index = trajectory_cleanup_index(
+        iter_index,
+        clean_traj,
+        jdata.get("model_devi_restart_from_last", False)
+        or any(
+            job.get("ensemble", job.get("ens")) == "plasma"
+            for job in jdata.get("model_devi_jobs", [])
+        ),
+    )
+    modd_path = (
+        os.path.join(make_iter_name(clean_index), model_devi_name)
+        if clean_index is not None
+        else None
+    )
     if modd_path is not None:
         md_trajs = glob.glob(os.path.join(modd_path, "task*/traj"))
         for ii in md_trajs:
             shutil.rmtree(ii)
+        for task in Path(modd_path).glob("task.*.*"):
+            if (task / "plasma.json").exists() and (task / "checkpoints").exists():
+                shutil.rmtree(task / "checkpoints")
 
 
 def set_version(mdata):

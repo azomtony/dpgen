@@ -336,6 +336,25 @@ def model_devi_jobs_args() -> list[Argument]:
         Argument("nsteps", int, optional=True, doc=doc_nsteps),
         Argument("nbeads", int, optional=True, doc=doc_nbeads),
         Argument("ensemble", str, optional=True, doc=doc_ensemble),
+        Argument(
+            "plasma",
+            dict,
+            optional=True,
+            doc="Cu/O plasma deposition controls; see the plasma exploration example.",
+        ),
+        Argument(
+            "selection",
+            dict,
+            optional=True,
+            doc="Event-balanced plasma FP budgets and independent validation budget.",
+        ),
+        Argument(
+            "plasma_stop_factor",
+            float,
+            optional=True,
+            default=2.0,
+            doc="Stop plasma exploration at this multiple of an upper trust limit.",
+        ),
         Argument("neidelay", int, optional=True, doc=doc_neidelay),
         Argument("taut", float, optional=True, doc=doc_taut),
         Argument("taup", float, optional=True, doc=doc_taup),
@@ -476,6 +495,17 @@ The union of the two sets is made as candidate dataset."
             bool,
             optional=True,
             doc=doc_model_devi_f_avg_relative,
+        ),
+        Argument(
+            "model_devi_restart_from_last",
+            bool,
+            optional=True,
+            default=False,
+            doc="Start native classical LAMMPS tasks from the latest accurate or "
+            "candidate frame of a matching task in the previous iteration. "
+            "Match system, initial structure, ensemble, temperature and pressure; "
+            "fall back to the initial structure if no usable frame exists. "
+            "Retains at least the latest iteration's trajectories for continuation.",
         ),
         Argument(
             "model_devi_clean_traj",
@@ -673,7 +703,10 @@ def fp_style_vasp_args() -> list[Argument]:
     doc_fp_incar = (
         "Input file for VASP. INCAR must specify KSPACING and KGAMMA. "
         "This may be a string used by all FP tasks, a list indexed by system index, "
-        "or a dict keyed by system index with an optional 'default' entry."
+        "or a dict keyed by system index with an optional 'default' entry. "
+        "A dict entry may itself map alphabetically sorted species joined by '-' "
+        "(e.g. 'Cu' or 'Cu-O') to input files, with optional 'default'. "
+        "Species are determined from each task's POSCAR, not its initial structure."
     )
     doc_fp_aniso_kspacing = "Set anisotropic kspacing. Usually useful for 1-D or 2-D materials. Only support VASP. If it is setting the KSPACING key in INCAR will be ignored."
     doc_fp_kpoints = (

@@ -1,0 +1,36 @@
+{
+  "sys_idx": [
+    0
+  ],
+  "ensemble": "plasma",
+  "temps": [
+    293.0
+  ],
+  "trj_freq": 10,
+  "plasma_stop_factor": 2.0,
+  "plasma": {
+    "nions": 10,
+    "eion": 10.0,
+    "ratio": 10,
+    "ion_dt": 5.0,
+    "surface": 100,
+    "a": 3.62716774,
+    "eq_time": 5.0,
+    "eq_trj_freq": 1000,
+    "checkpoint_freq": 1000,
+    "edge": 2.0,
+    "margin": 2.0,
+    "height": 8.0,
+    "initial_dt": 1e-05,
+    "max_dt": 0.0005,
+    "max_displacement": 0.01
+  },
+  "selection": {
+    "eq_fraction": 0.1,
+    "ion_fraction": 0.3,
+    "neutral_fraction": 0.5,
+    "validation_fraction": 0.1,
+    "max_frames_per_event": 3,
+    "min_time_separation": 0.01
+  }
+}

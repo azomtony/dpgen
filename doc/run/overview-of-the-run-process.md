@@ -166,3 +166,55 @@ compression is unsupported. The supported path is ordinary energy/force
 full-model fine-tuning; LoRA and spin workflows have not been validated.
 
 See `examples/run/dpa4-finetune/README.md` for a configuration recipe.
+
+
+### Continue exploration from a previous trajectory
+
+For native classical LAMMPS exploration in either `dpgen run` or
+`dpgen finetune`, set this top-level option in `param.json`:
+
+```json
+"model_devi_restart_from_last": true
+```
+
+Each new task looks for a task in the immediately preceding iteration with the
+same system index, original starting-structure path, ensemble, temperature,
+and pressure. Electronic temperature and PKA energy must also match when used.
+Matching uses conditions rather than task numbering, so reordering the list of
+temperatures does not change which trajectory is continued. Existing native
+tasks without restart metadata can be matched through their original structure
+symlinks.
+
+DP-GEN searches saved frames backward in timestep order, choosing the latest
+readable frame whose maximum force and virial deviations are both strictly below
+their upper trust limits. Accurate and candidate frames qualify; equality with
+an upper limit, nonfinite deviations, and failed frames do not. Selection uses
+the preceding iteration's trust settings (including per-system and per-job
+limits), `model_devi_skip`, and force normalization when enabled. The usual
+virial upper-limit default is `1e10`. Both separate `traj/*.lammpstrj` files and
+merged `all.lammpstrj` trajectories are supported.
+
+If there is no matching task or no acceptable saved frame, the task starts from
+its original structure. DP-GEN writes the source task and timestep, or the
+fallback reason, into `job.json` under `restart`, and logs the decision.
+Coordinates and the simulation cell are continued; velocities are initialized
+afresh by the normal exploration input.
+
+With this option enabled, trajectory cleanup retains at least the latest
+iteration so it can supply the next iteration's starting frames. A longer
+`model_devi_clean_traj` retention setting or `false` is still respected.
+Trajectories removed before enabling the option cannot be recovered. The option
+applies when exploration tasks are created; it does not rewind already completed
+tasks. It defaults to `false`, preserving the original starting-structure and
+cleanup behavior. Template inputs, PIMD, and cluster selection are not supported
+with this option.
+
+### Plasma deposition exploration
+
+Use `"ensemble": "plasma"` in a LAMMPS `model_devi_jobs` entry for Cu/O energetic
+and thermal oxygen deposition. Controls include separate equilibration/exposure
+sampling, committee stopping, velocity-preserving continuation, transactional
+checkpoints, event-balanced FP budgets, and held-out validation events. See the
+[plasma configuration recipe](../../examples/run/plasma/README.md) and its
+`job.json` for settings and recovery behavior. Labeling continues to use the
+existing VASP single-point workflow.

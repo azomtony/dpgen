@@ -134,7 +134,8 @@ Path("result.json").write_text(json.dumps({"start": start, "end": time.monotonic
         from dpgen.dispatcher.interactive import LocalSubmission
         from dpgen.main import main_parser
 
-        def run_workflow(*args):
+        def run_workflow(*args, force_train=False):
+            self.assertFalse(force_train)
             submission = make_submission(
                 {"batch_type": "Slurm", "local_root": "/unused"},
                 {},
@@ -164,7 +165,8 @@ Path("result.json").write_text(json.dumps({"start": start, "end": time.monotonic
                     [command, "param.json", "machine.json", "--gpus", "0", "1"]
                 )
                 args.func(args)
-                run.assert_called_once_with("param.json", "machine.json")
+                expected = {"force_train": False} if command == "finetune" else {}
+                run.assert_called_once_with("param.json", "machine.json", **expected)
             self.assertIsNone(local_submission({}, [], ".", [], "log", "log"))
 
     def test_batch_submission_still_uses_dispatcher(self):
