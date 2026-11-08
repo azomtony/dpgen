@@ -770,6 +770,58 @@ class TestFPRecovery(unittest.TestCase):
         self.assertFalse(Path("missing").exists())
         self.assertFalse(calculated.exists())
 
+    def test_explicit_resume_keeps_saved_resources_when_current_settings_differ(self):
+        from dpgen.dispatcher.Dispatcher import make_submission
+
+        name = "task.019.000000"
+        self.make_inputs(name)
+        common = dict(
+            commands=["vasp"],
+            work_path=str(self.root),
+            run_tasks=[name],
+            group_size=1,
+            forward_common_files=[],
+            forward_files=["POSCAR", "INCAR", "POTCAR", "KPOINTS"],
+            backward_files=["OUTCAR"],
+            outlog="fp.log",
+            errlog="fp.log",
+        )
+        original = make_submission(self.real_machine(), self.real_resources(), **common)
+        original.generate_jobs()
+        original.upload_jobs()
+        original.belonging_jobs[0].job_id = "9911"
+        original.belonging_jobs[0].job_state = JobStatus.running
+        original.submission_to_json()
+        directory = original.machine.context.remote_root
+        changed = dict(
+            self.real_resources(), cpu_per_node=4, queue_name="another-partition"
+        )
+        probe = make_submission(
+            self.real_machine(),
+            changed,
+            submission_class=recovery.RecoverySubmission,
+            **common,
+        )
+        probe.generate_jobs()
+        replacement = probe.machine.context.remote_root
+        with patch.object(recovery.dlog, "warning") as warning:
+            selected, wrapped, location = recovery._load_existing(
+                probe, directory, self.root.resolve(), [name], "vasp"
+            )
+        self.assertFalse(wrapped)
+        self.assertEqual(selected.submission_hash, original.submission_hash)
+        self.assertEqual(selected.belonging_jobs[0].job_id, "9911")
+        self.assertEqual(selected.resources.cpu_per_node, 1)
+        self.assertEqual(selected.resources.queue_name, "gpu")
+        self.assertEqual(selected.belonging_jobs[0].resources.queue_name, "gpu")
+        self.assertEqual(
+            set(selected.resource_difference_fields), {"cpu_per_node", "queue_name"}
+        )
+        self.assertEqual(location, directory)
+        self.assertFalse(Path(replacement).exists())
+        warning.assert_called_once()
+        self.assertEqual(changed["queue_name"], "another-partition")
+
     def test_exclusive_campaign_lock(self):
         import fcntl
 

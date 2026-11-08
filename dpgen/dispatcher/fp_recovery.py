@@ -607,6 +607,21 @@ class RecoverySubmission(Submission):
         self._save()
 
 
+def _resource_difference_fields(saved, current, prefix=""):
+    differences = []
+    for key in sorted(saved.keys() | current.keys()):
+        field = f"{prefix}.{key}" if prefix else key
+        if key not in saved or key not in current:
+            differences.append(field)
+        elif isinstance(saved[key], dict) and isinstance(current[key], dict):
+            differences.extend(
+                _resource_difference_fields(saved[key], current[key], field)
+            )
+        elif saved[key] != current[key]:
+            differences.append(field)
+    return differences
+
+
 def _load_existing(probe, locator, root, paths, command):
     context = probe.machine.context
     locator = os.path.normpath(locator)
@@ -654,9 +669,18 @@ def _load_existing(probe, locator, root, paths, command):
         raise ValueError(
             "Existing submission identity is incompatible with the current machine settings; restore the original machine.json"
         )
-    if submission.resources.serialize() != probe.resources.serialize():
-        raise ValueError(
-            "Existing FP resources differ from machine.json; restore the original submission settings"
+    differences = _resource_difference_fields(
+        submission.resources.serialize(), probe.resources.serialize()
+    )
+    submission.resource_difference_fields = differences
+    if differences:
+        # Resource values can contain credentials in envs/prepend_script. Report
+        # field names only; the saved record remains authoritative for this stage.
+        dlog.warning(
+            "FP recovery: machine.json resource fields differ: %s. "
+            "Using the existing submission's saved resources for these jobs and retries; "
+            "current settings apply to new submissions.",
+            ", ".join(differences),
         )
     if Path(context.temp_local_root, submission.work_base).resolve() != root:
         raise ValueError(
@@ -747,8 +771,6 @@ def _run_recovery(
     config = options(jdata)
     if jdata["fp_style"] != "vasp" or mdata["fp_machine"].get("batch_type") != "Slurm":
         raise ValueError("FP recovery currently supports VASP single points with Slurm")
-    if mdata["fp_resources"].get("group_size", mdata.get("fp_group_size", 1)) != 1:
-        raise ValueError("FP recovery requires fp.resources.group_size=1")
     work_base = os.fspath(root)
     root = Path(root).resolve()
     command = mdata["fp_command"]
@@ -769,6 +791,11 @@ def _run_recovery(
     ledger = json.loads(manifest.read_text()) if manifest.exists() else None
     explicit = requested_directory(root)
     locator = explicit or (ledger.get("existing_directory") if ledger else None)
+    if (
+        not locator
+        and mdata["fp_resources"].get("group_size", mdata.get("fp_group_size", 1)) != 1
+    ):
+        raise ValueError("FP recovery requires fp.resources.group_size=1")
     if ledger and ledger["signature"] != signature and not explicit:
         raise RuntimeError(
             "FP inputs or submission settings changed; refusing to overwrite or duplicate an existing recovery campaign"
@@ -823,6 +850,7 @@ def _run_recovery(
             submission_hash=selected.submission_hash,
             remote_root=directory,
             instrumented=wrapped,
+            resource_difference_fields=selected.resource_difference_fields,
         )
         worker.atomic_json(manifest, ledger)
         selected.configure_recovery(root, config, ledger, instrumented=wrapped)

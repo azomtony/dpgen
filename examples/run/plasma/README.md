@@ -359,8 +359,11 @@ not the parent containing several temporary directories. You can alternatively
 supply the absolute path to that submission JSON file. The option implies FP
 recovery for the selected stage even if `fp_recovery.enabled` was not set.
 
-The record must match the current FP stage, task inputs, command and original
-machine/resource settings. Inputs are checked before staging uploads. Recovery
+The record must match the current FP stage, task inputs, command and machine
+identity. Resource differences from `machine.json` are logged by field name;
+the saved submission's resources remain authoritative for its existing jobs and
+retries. Current resource settings apply to new submissions, not jobs being
+resumed. Inputs are checked before staging uploads. Recovery
 restores the saved jobs and job IDs and pins every subsequent bind/upload to
 this directory. A missing record, changed input, incompatible settings or a
 record for another iteration produces an error; it never falls back to creating
