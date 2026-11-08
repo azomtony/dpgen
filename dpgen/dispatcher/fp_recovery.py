@@ -271,15 +271,30 @@ class RecoverySubmission(Submission):
                     for task in job.job_task_list:
                         task.task_state = JobStatus.terminated
             self._save()
+            self._activity("checking existing scheduler jobs")
             self.update_submission_state()
-            active = [
-                entry
-                for entry in self.recovery_ledger["tasks"].values()
-                if entry.get("status") not in ("successful", "failed")
+            pending = [
+                job
+                for job in self.belonging_jobs
+                if job.job_state == JobStatus.unsubmitted
+                and self.recovery_ledger["tasks"][
+                    job.job_task_list[0].task_work_path
+                ].get("status")
+                not in ("successful", "failed")
             ]
-            if active:
-                self.upload_jobs()
+            if pending:
+                self._activity("staging inputs for unsubmitted tasks")
+                tasks, jobs = self.belonging_tasks, self.belonging_jobs
+                self.belonging_jobs = pending
+                self.belonging_tasks = [
+                    task for job in pending for task in job.job_task_list
+                ]
+                try:
+                    self.upload_jobs()
+                finally:
+                    self.belonging_tasks, self.belonging_jobs = tasks, jobs
             while True:
+                self._activity("handling job states and retry decisions")
                 self.handle_unexpected_submission_state(continue_on_failure=True)
                 self.submission_to_json()
                 self._save()
@@ -288,7 +303,9 @@ class RecoverySubmission(Submission):
                     for entry in self.recovery_ledger["tasks"].values()
                 ):
                     break
+                self._log_progress(check_interval)
                 time.sleep(check_interval)
+                self._activity("checking existing scheduler jobs")
                 self.update_submission_state()
             failed = [
                 name
@@ -311,6 +328,38 @@ class RecoverySubmission(Submission):
                     "Could not update remote FP state; local manifest retained"
                 )
 
+    def _activity(self, phase, task=None):
+        self.recovery_ledger["activity"] = {
+            "phase": phase,
+            "task": task,
+            "started": time.time(),
+        }
+        self._save()
+        dlog.info("FP recovery: %s%s", phase, f" ({task})" if task else "")
+
+    def _log_progress(self, interval):
+        counts = {}
+        for entry in self.recovery_ledger["tasks"].values():
+            state = entry.get("status", "pending")
+            counts[state] = counts.get(state, 0) + 1
+        self.recovery_ledger["counts"] = counts
+        self.recovery_ledger["activity"] = {
+            "phase": "waiting for next scheduler check",
+            "started": time.time(),
+        }
+        self._save()
+        dlog.info(
+            "FP recovery progress: successful=%d/%d running=%d waiting=%d retry_wait=%d pending=%d failed=%d; next check in %s s",
+            counts.get("successful", 0),
+            len(self.recovery_ledger["tasks"]),
+            counts.get("running", 0) + counts.get("completing", 0),
+            counts.get("waiting", 0),
+            counts.get("retry_wait", 0),
+            counts.get("pending", 0) + counts.get("submitted", 0),
+            counts.get("failed", 0),
+            interval,
+        )
+
     def _save(self):
         self.recovery_ledger["submission_hash"] = self.submission_hash
         self.recovery_ledger["remote_root"] = str(self.machine.context.remote_root)
@@ -327,6 +376,7 @@ class RecoverySubmission(Submission):
             return local.read_text(errors="replace") if local.exists() else ""
 
     def _download_job(self, job):
+        self._activity("collecting outputs", job.job_task_list[0].task_work_path)
         # Narrow the download view without changing submission identity or
         # scheduler jobs. Missing failed-attempt artifacts are diagnostic only.
         tasks, jobs = self.belonging_tasks, self.belonging_jobs
@@ -403,6 +453,7 @@ class RecoverySubmission(Submission):
             if entry.get("status") == "successful":
                 continue
             self._download_job(job)
+            self._activity("validating VASP results", name)
             valid, reason = self.recovery_validator(self.recovery_root / name)
             if valid:
                 entry.update(status="successful", job_id=str(job.job_id), reason=reason)
@@ -521,11 +572,10 @@ class RecoverySubmission(Submission):
                 raise RuntimeError(
                     f"Cannot establish scheduler state of {name}, job {job.job_id}; preserving state rather than submitting a duplicate"
                 )
-            if job.job_state == FAILED:
-                continue
             if job.job_state != JobStatus.terminated:
                 continue
             if entry.get("last_failure_job_id") != str(job.job_id):
+                self._activity("diagnosing terminated Slurm job", name)
                 diagnostic = self._diagnose(job, name)
                 category = diagnostic["category"]
                 entry.update(

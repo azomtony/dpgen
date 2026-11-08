@@ -150,6 +150,42 @@ class TestFPRecovery(unittest.TestCase):
         history = (self.root / "fp-recovery-history.jsonl").read_text().splitlines()
         self.assertEqual(len(history), 12)
 
+    def test_legacy_failed_alias_does_not_skip_terminated_jobs(self):
+        task, job = task_job("task.019.000000")
+        submission = self.submission([job])
+        submission._diagnose = Mock(
+            return_value={
+                "category": "hardware",
+                "reason": "ECC error",
+                "scheduler": {},
+                "attempt": {},
+            }
+        )
+        with patch.object(recovery, "FAILED", JobStatus.terminated):
+            submission.handle_unexpected_submission_state(continue_on_failure=True)
+        self.assertEqual(job.submit_job.call_count, 1)
+        self.assertEqual(
+            submission.recovery_ledger["tasks"][task.task_work_path][
+                "hardware_failures"
+            ],
+            1,
+        )
+
+    def test_progress_heartbeat_records_waiting_and_retry_counts(self):
+        task, job = task_job("task.019.000000", state=JobStatus.running)
+        other, waiting = task_job("task.020.000000", "2", JobStatus.waiting)
+        submission = self.submission([job, waiting])
+        submission.recovery_ledger["tasks"][task.task_work_path]["status"] = "running"
+        submission.recovery_ledger["tasks"][other.task_work_path]["status"] = (
+            "retry_wait"
+        )
+        with patch.object(recovery.dlog, "info") as log:
+            submission._log_progress(30)
+        state = json.loads((self.root / ".fp-recovery.json").read_text())
+        self.assertEqual(state["counts"], {"running": 1, "retry_wait": 1})
+        self.assertEqual(state["activity"]["phase"], "waiting for next scheduler check")
+        self.assertIn("next check", log.call_args.args[0])
+
     def test_nonhardware_bounded_and_running_sibling_not_resubmitted(self):
         task, failing = task_job("task.019.000000")
         _, running = task_job("task.019.000001", "99", JobStatus.running)
@@ -404,9 +440,22 @@ class TestFPRecovery(unittest.TestCase):
 
         first.get_job_state.side_effect = update_first
         sibling.get_job_state.side_effect = update_sibling
-        with patch("dpgen.dispatcher.fp_recovery.time.sleep"):
+        waits = []
+
+        def fake_wait(seconds):
+            waits.append(seconds)
+            if len(waits) > 5:
+                raise AssertionError(
+                    "Recovery stalled instead of retrying the terminated job"
+                )
+
+        with (
+            patch("dpgen.dispatcher.fp_recovery.time.sleep", side_effect=fake_wait),
+            patch.object(recovery, "FAILED", JobStatus.terminated),
+        ):
             result = submission.run_submission(clean=False, check_interval=1)
         self.assertEqual(result, {"complete": True})
+        submission.upload_jobs.assert_not_called()
         self.assertEqual(first.submit_job.call_count, 1)
         sibling.submit_job.assert_not_called()
         self.assertTrue(

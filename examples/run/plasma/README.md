@@ -376,3 +376,12 @@ selection applies only to the first FP stage reached by that invocation; later
 iterations do not accidentally reuse the old staging directory. Resume while
 `record.dpgen` still points to that iteration's FP work; this option does not
 rewind completed workflow stages.
+
+
+FP recovery prints a progress heartbeat every `check_interval`, including
+successful, running, waiting, retry-wait, pending and failed counts. Before a
+potentially slow operation it logs whether it is querying Slurm, collecting
+outputs, validating results, staging pending inputs, or diagnosing a failure.
+The local `.fp-recovery.json` also records the last activity and timestamp.
+Already-submitted jobs do not trigger bulk input restaging during recovery;
+inputs are staged for unsubmitted tasks or restored when a retry needs them.
