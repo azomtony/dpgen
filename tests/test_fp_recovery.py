@@ -600,6 +600,73 @@ class TestFPRecovery(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "refusing to overwrite or duplicate"):
             recovery.run_recovery(self.root, data, mdata, files, outputs)
 
+    def test_legacy_bind_and_deserialize_signatures_preserve_existing_job(self):
+        from dpdispatcher import Submission
+
+        from dpgen.dispatcher.Dispatcher import make_submission
+
+        name = "task.019.000000"
+        self.make_inputs(name)
+        original = make_submission(
+            self.real_machine(),
+            self.real_resources(),
+            commands=["vasp"],
+            work_path=str(self.root),
+            run_tasks=[name],
+            group_size=1,
+            forward_common_files=[],
+            forward_files=["POSCAR", "INCAR", "POTCAR", "KPOINTS"],
+            backward_files=["OUTCAR"],
+            outlog="fp.log",
+            errlog="fp.log",
+        )
+        original.generate_jobs()
+        original.upload_jobs()
+        original.belonging_jobs[0].job_id = "8811"
+        original.belonging_jobs[0].job_state = JobStatus.running
+        original.belonging_jobs[0].job_task_list[0].task_state = JobStatus.running
+        original.submission_to_json()
+        directory = original.machine.context.remote_root
+        record = original.serialize()
+
+        def legacy_bind(instance, machine):
+            raise AssertionError("Legacy binding must be handled by the adapter")
+
+        def legacy_deserialize(cls, submission_dict):
+            raise AssertionError("Do not use the incompatible vendor deserializer")
+
+        with (
+            patch.object(Submission, "bind_machine", legacy_bind),
+            patch.object(Submission, "deserialize", classmethod(legacy_deserialize)),
+        ):
+            restored = recovery.RecoverySubmission.deserialize(
+                record, machine=original.machine, bind_context=False
+            )
+            self.assertEqual(original.machine.context.remote_root, directory)
+            restored.existing_remote_root = directory
+            restored.bind_machine(original.machine)
+            restored.try_recover_from_json()
+            self.assertEqual(restored.submission_hash, original.submission_hash)
+            self.assertEqual(restored.belonging_jobs[0].job_id, "8811")
+            self.assertEqual(restored.belonging_jobs[0].job_state, JobStatus.running)
+            self.assertEqual(restored.machine.context.remote_root, directory)
+            # Also exercise the constructor path from the user's traceback.
+            fresh = make_submission(
+                self.real_machine(),
+                self.real_resources(),
+                commands=["vasp"],
+                work_path=str(self.root),
+                run_tasks=[name],
+                group_size=1,
+                forward_common_files=[],
+                forward_files=["POSCAR"],
+                backward_files=["OUTCAR"],
+                outlog="fp.log",
+                errlog="fp.log",
+                submission_class=recovery.RecoverySubmission,
+            )
+            self.assertIsInstance(fresh, recovery.RecoverySubmission)
+
     def test_cli_existing_dir_is_scoped_to_one_fp_stage(self):
         from dpgen.main import main_parser
 

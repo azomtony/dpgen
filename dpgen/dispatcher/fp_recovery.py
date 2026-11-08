@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -15,7 +16,7 @@ from shlex import quote
 
 import dpdata
 import numpy as np
-from dpdispatcher import Submission
+from dpdispatcher import Job, Resources, Submission
 from dpdispatcher.submission import JobStatus
 
 from dpgen import dlog
@@ -59,6 +60,11 @@ def requested_directory(root):
 
 
 FAILED = getattr(JobStatus, "failed", JobStatus.terminated)
+ACTIVE_STATES = tuple(
+    getattr(JobStatus, name)
+    for name in ("waiting", "running", "completing")
+    if hasattr(JobStatus, name)
+)
 
 
 DEFAULTS = {
@@ -147,12 +153,78 @@ class RecoverySubmission(Submission):
     """Keep the dispatcher's identity/recovery lifecycle; replace blind retries."""
 
     def bind_machine(self, machine, *, bind_context=True):
-        result = super().bind_machine(machine, bind_context=bind_context)
+        parent = super().bind_machine
+        if "bind_context" in inspect.signature(parent).parameters:
+            parent(machine, bind_context=bind_context)
+        else:
+            # Older DPDispatcher cannot suppress context binding. Reproduce the
+            # core bind operations so inspecting an existing record never changes
+            # its authenticated session or resets the selected staging directory.
+            self.machine = machine
+            for job in self.belonging_jobs:
+                job.machine = machine
+            self.submission_hash = self.get_hash()
+            if machine is not None:
+                if bind_context:
+                    machine.context.bind_submission(self)
+                self.local_root = machine.context.temp_local_root
         directory = getattr(self, "existing_remote_root", None)
         if machine is not None and bind_context and directory:
             machine.context.remote_root = directory
             machine.context.temp_remote_root = os.path.dirname(directory)
-        return result
+        return self
+
+    @classmethod
+    def deserialize(cls, submission_dict, machine=None, *, bind_context=True):
+        """Restore records without newer vendor-only constructor/deserializer kwargs."""
+        if machine is None:
+            raise ValueError("FP recovery requires the already configured machine")
+        restored = cls(
+            work_base=submission_dict["work_base"],
+            machine=None,
+            resources=Resources.deserialize(submission_dict["resources"]),
+            forward_common_files=submission_dict.get("forward_common_files", []),
+            backward_common_files=submission_dict.get("backward_common_files", []),
+            task_list=[],
+        )
+        if "_abs_work_base" in submission_dict:
+            restored._abs_work_base = submission_dict["_abs_work_base"]
+        restored.previous_submission_hash = submission_dict.get(
+            "previous_submission_hash"
+        )
+        restored.belonging_jobs = [
+            Job.deserialize(value) for value in submission_dict["belonging_jobs"]
+        ]
+        restored.belonging_tasks = [
+            task for job in restored.belonging_jobs for task in job.job_task_list
+        ]
+        for job in restored.belonging_jobs:
+            job.job_state = JobStatus(job.job_state)
+            for task in job.job_task_list:
+                task.task_state = JobStatus(getattr(task, "task_state", job.job_state))
+        restored.bind_machine(machine, bind_context=bind_context)
+        return restored
+
+    def try_recover_from_json(self):
+        # Vendor implementations may call a newer deserialize signature or open
+        # another SSH connection. Keep recovery in this compatibility adapter.
+        name = f"{self.submission_hash}.json"
+        if not self.machine.context.check_file_exists(name):
+            return
+        record = json.loads(self.machine.context.read_file(name))
+        restored = self.deserialize(record, machine=self.machine, bind_context=False)
+        if restored.submission_hash != self.submission_hash:
+            raise RuntimeError(
+                "Existing submission identity is incompatible; refusing to create replacement FP jobs"
+            )
+        self.belonging_jobs = restored.belonging_jobs
+        self.belonging_tasks = restored.belonging_tasks
+        self.bind_machine(self.machine)
+        dlog.info(
+            "FP recovery: restored existing submission %s at %s",
+            self.submission_hash,
+            self.machine.context.remote_root,
+        )
 
     def configure_recovery(
         self, root, config, ledger, validator=validate_vasp, instrumented=True
@@ -361,7 +433,8 @@ class RecoverySubmission(Submission):
         elif not log and not self.instrumented:
             log = self._read_remote(Path(name) / "fp.log")[-16000:]
         try:
-            backend = job.get_last_error_message() or ""
+            reader = getattr(job, "get_last_error_message", None)
+            backend = (reader() or "") if callable(reader) else ""
         except (OSError, RuntimeError):
             backend = ""
         current_evidence = log if self.instrumented else log + "\n" + backend
@@ -440,12 +513,8 @@ class RecoverySubmission(Submission):
                 self._refresh_worker_policy(job, name)
                 self._submit_with_intent(job, entry)
                 continue
-            if job.job_state in (
-                JobStatus.waiting,
-                JobStatus.running,
-                JobStatus.completing,
-            ):
-                entry["status"] = job.job_state.name
+            if job.job_state in ACTIVE_STATES:
+                entry["status"] = JobStatus(job.job_state).name
                 continue
             if job.job_state == JobStatus.unknown:
                 self._save()
