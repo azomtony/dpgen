@@ -115,6 +115,9 @@ def main_parser() -> argparse.ArgumentParser:
     parser_run.add_argument("MACHINE", type=str, help="machine file, json/yaml format")
     parser_run.add_argument("-d", "--debug", action="store_true", help="log debug info")
     add_interactive_args(parser_run)
+    from dpgen.dispatcher.fp_recovery import add_recovery_args
+
+    add_recovery_args(parser_run)
     parser_run.set_defaults(func=gen_run)
 
     # finetune
@@ -136,6 +139,7 @@ def main_parser() -> argparse.ArgumentParser:
         help="Train even without new FP data or when skip_train is set; resume copied training.",
     )
     add_interactive_args(parser_finetune)
+    add_recovery_args(parser_finetune)
     parser_finetune.set_defaults(func=gen_finetune)
 
     # run/report

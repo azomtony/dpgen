@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -598,6 +599,109 @@ class TestFPRecovery(unittest.TestCase):
         (self.root / name / "INCAR").write_text("different settings")
         with self.assertRaisesRegex(RuntimeError, "refusing to overwrite or duplicate"):
             recovery.run_recovery(self.root, data, mdata, files, outputs)
+
+    def test_cli_existing_dir_is_scoped_to_one_fp_stage(self):
+        from dpgen.main import main_parser
+
+        directory = str(Path("old-stage").resolve())
+        for command in ("run", "finetune"):
+            args = main_parser().parse_args(
+                [command, "param.json", "machine.json", "--fp-existing-dir", directory]
+            )
+            with recovery.recovery_execution(args):
+                self.assertEqual(recovery.requested_directory(self.root), directory)
+                self.assertEqual(recovery.requested_directory(self.root), directory)
+                self.assertIsNone(recovery.requested_directory("iter.000002/02.fp"))
+            self.assertIsNone(recovery.requested_directory(self.root))
+
+    def test_explicit_directory_pins_original_record_and_never_creates_replacement(
+        self,
+    ):
+        from dpgen.dispatcher.Dispatcher import make_submission
+
+        name = "task.019.000000"
+        self.make_inputs(name)
+        files = ["POSCAR", "INCAR", "POTCAR", "KPOINTS"]
+        outputs = ["fp.log", "OUTCAR", "vasprun.xml"]
+        machine, resources = self.real_machine(), self.real_resources()
+        original = make_submission(
+            machine,
+            resources,
+            commands=["vasp"],
+            work_path=str(self.root),
+            run_tasks=[name],
+            group_size=1,
+            forward_common_files=[],
+            forward_files=files,
+            backward_files=outputs,
+            outlog="fp.log",
+            errlog="fp.log",
+        )
+        original.generate_jobs()
+        original.upload_jobs()
+        original.belonging_jobs[0].job_id = "7711"
+        original.belonging_jobs[0].job_state = JobStatus.running
+        original.belonging_jobs[0].job_task_list[0].task_state = JobStatus.running
+        original.submission_to_json()
+        calculated = Path(original.machine.context.remote_root)
+        selected_directory = Path("existing-old-fp").resolve()
+        shutil.move(str(calculated), selected_directory)
+        resumed = []
+
+        def inspect_resume(submission, **kwargs):
+            submission.try_recover_from_json()
+            submission.upload_jobs()
+            submission._save()
+            resumed.append(submission)
+
+        data = {"fp_style": "vasp", "fp_recovery": {"enabled": True}}
+        mdata = {
+            "fp_command": "vasp",
+            "fp_machine": machine,
+            "fp_resources": resources,
+            "fp_group_size": 1,
+        }
+        args = SimpleNamespace(fp_existing_dir=str(selected_directory))
+        with (
+            patch.object(
+                recovery.RecoverySubmission,
+                "run_submission",
+                autospec=True,
+                side_effect=inspect_resume,
+            ),
+            patch.object(
+                recovery, "validate_vasp", return_value=(False, "not local yet")
+            ),
+        ):
+            with recovery.recovery_execution(args):
+                recovery.run_recovery(self.root, data, mdata, files, outputs)
+            # The pinned directory persists in the local manifest for later resumes.
+            recovery.run_recovery(self.root, data, mdata, files, outputs)
+        self.assertEqual(len(resumed), 2)
+        self.assertTrue(
+            all(
+                item.machine.context.remote_root == str(selected_directory)
+                for item in resumed
+            )
+        )
+        self.assertTrue(
+            all(item.belonging_jobs[0].job_id == "7711" for item in resumed)
+        )
+        self.assertTrue(
+            all(item.submission_hash == original.submission_hash for item in resumed)
+        )
+        self.assertFalse(calculated.exists())
+        manifest = json.loads((self.root / ".fp-recovery.json").read_text())
+        self.assertEqual(manifest["existing_directory"], str(selected_directory))
+        # Explicitly selecting a nonexistent directory must not silently fall
+        # back to the calculated hash directory or create any replacement.
+        with recovery.recovery_execution(
+            SimpleNamespace(fp_existing_dir=str(Path("missing").resolve()))
+        ):
+            with self.assertRaises((FileNotFoundError, ValueError, OSError)):
+                recovery.run_recovery(self.root, data, mdata, files, outputs)
+        self.assertFalse(Path("missing").exists())
+        self.assertFalse(calculated.exists())
 
     def test_exclusive_campaign_lock(self):
         import fcntl

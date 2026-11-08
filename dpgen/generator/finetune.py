@@ -741,7 +741,9 @@ def gen_finetune(args):
         dlog.info("start fine-tuning")
         from dpgen.dispatcher.interactive import interactive_execution
 
-        with interactive_execution(args):
+        from dpgen.dispatcher.fp_recovery import recovery_execution
+
+        with interactive_execution(args), recovery_execution(args):
             run_finetune_iter(
                 args.PARAM,
                 args.MACHINE,

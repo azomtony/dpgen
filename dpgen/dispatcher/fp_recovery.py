@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from shlex import quote
 
@@ -18,6 +20,43 @@ from dpdispatcher.submission import JobStatus
 
 from dpgen import dlog
 from dpgen.dispatcher import fp_recovery_worker as worker
+
+_existing_request = ContextVar("fp_existing_directory", default=None)
+
+
+def add_recovery_args(parser):
+    parser.add_argument(
+        "--fp-existing-dir",
+        metavar="PATH",
+        help="Resume FP jobs from this existing staging directory (or submission JSON); never create a replacement directory.",
+    )
+
+
+@contextmanager
+def recovery_execution(args):
+    path = getattr(args, "fp_existing_dir", None)
+    if path and not os.path.isabs(os.path.expanduser(path)):
+        raise ValueError(
+            "--fp-existing-dir requires an absolute path on the configured FP machine"
+        )
+    token = _existing_request.set(
+        {"path": os.path.expanduser(path), "stage": None} if path else None
+    )
+    try:
+        yield
+    finally:
+        _existing_request.reset(token)
+
+
+def requested_directory(root):
+    request = _existing_request.get()
+    if request is None:
+        return None
+    stage = str(Path(root).resolve())
+    if request["stage"] is None:
+        request["stage"] = stage
+    return request["path"] if request["stage"] == stage else None
+
 
 FAILED = getattr(JobStatus, "failed", JobStatus.terminated)
 
@@ -107,6 +146,14 @@ def _text(stream):
 class RecoverySubmission(Submission):
     """Keep the dispatcher's identity/recovery lifecycle; replace blind retries."""
 
+    def bind_machine(self, machine, *, bind_context=True):
+        result = super().bind_machine(machine, bind_context=bind_context)
+        directory = getattr(self, "existing_remote_root", None)
+        if machine is not None and bind_context and directory:
+            machine.context.remote_root = directory
+            machine.context.temp_remote_root = os.path.dirname(directory)
+        return result
+
     def configure_recovery(
         self, root, config, ledger, validator=validate_vasp, instrumented=True
     ):
@@ -147,6 +194,10 @@ class RecoverySubmission(Submission):
                 if not job.job_id and entry.get("job_id"):
                     job.job_id = entry["job_id"]
                     job.job_state = JobStatus.waiting
+                if job.job_state == FAILED and entry.get("status") != "failed":
+                    job.job_state = JobStatus.terminated
+                    for task in job.job_task_list:
+                        task.task_state = JobStatus.terminated
             self._save()
             self.update_submission_state()
             active = [
@@ -487,6 +538,138 @@ class RecoverySubmission(Submission):
         self._save()
 
 
+def _load_existing(probe, locator, root, paths, command):
+    context = probe.machine.context
+    locator = os.path.normpath(locator)
+    original_root = context.remote_root
+    if re.fullmatch(r"[0-9a-f]{40}\.json", os.path.basename(locator)):
+        directory, record_name = os.path.dirname(locator), os.path.basename(locator)
+    else:
+        directory = locator
+        record_name = os.path.basename(directory) + ".json"
+        if not re.fullmatch(r"[0-9a-f]{40}\.json", record_name):
+            # Only list inside the supplied directory. Never search elsewhere
+            # and never create it when it is missing.
+            context.remote_root = directory
+            try:
+                code, _, stdout, stderr = context.block_call(
+                    "find . -maxdepth 1 -type f -name '*.json' -print"
+                )
+                candidates = [
+                    os.path.basename(line)
+                    for line in _text(stdout).splitlines()
+                    if re.fullmatch(r"[0-9a-f]{40}\.json", os.path.basename(line))
+                ]
+                if code or len(candidates) != 1:
+                    raise ValueError(
+                        "Existing directory must contain one submission JSON; supply its full JSON path if there are several"
+                    )
+                record_name = candidates[0]
+            finally:
+                context.remote_root = original_root
+    # Context path policies intentionally reject reads outside the bound staging
+    # root. Rebind to the user-selected existing root before reading its record.
+    context.remote_root = directory
+    try:
+        raw = context.read_file(record_name)
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"Cannot find existing FP submission {directory}/{record_name}; no replacement will be created"
+        ) from exc
+    record = json.loads(raw)
+    submission = RecoverySubmission.deserialize(
+        record, machine=probe.machine, bind_context=False
+    )
+    expected_hash = record_name[:-5]
+    if submission.submission_hash != expected_hash:
+        raise ValueError(
+            "Existing submission identity is incompatible with the current machine settings; restore the original machine.json"
+        )
+    if submission.resources.serialize() != probe.resources.serialize():
+        raise ValueError(
+            "Existing FP resources differ from machine.json; restore the original submission settings"
+        )
+    if Path(context.temp_local_root, submission.work_base).resolve() != root:
+        raise ValueError(
+            f"Existing directory belongs to a different iteration/stage ({submission.work_base}), not {root}"
+        )
+    recovered_names = [task.task_work_path for task in submission.belonging_tasks]
+    if not recovered_names or not set(recovered_names).issubset(paths):
+        raise ValueError("Existing submission contains different FP tasks")
+    if any(len(job.job_task_list) != 1 for job in submission.belonging_jobs):
+        raise ValueError("Existing submission must use one FP task per Slurm job")
+    wrapped = all(
+        task.command.strip() == "python fp_recovery_worker.py"
+        for task in submission.belonging_tasks
+    )
+    if not wrapped and any(
+        task.command.strip() != command.strip() for task in submission.belonging_tasks
+    ):
+        raise ValueError("Existing FP command differs from machine.json")
+    # Verify scientific inputs before any upload can overwrite an existing job.
+    for name in recovered_names:
+        for filename in ("POSCAR", "INCAR", "POTCAR", "KPOINTS"):
+            local = root / name / filename
+            if local.exists():
+                remote = context.read_file(os.path.join(directory, name, filename))
+                content = remote if isinstance(remote, bytes) else remote.encode()
+                if (
+                    hashlib.sha256(local.read_bytes()).digest()
+                    != hashlib.sha256(content).digest()
+                ):
+                    raise ValueError(
+                        f"Existing FP input differs: {name}/{filename}; refusing to overwrite or resubmit"
+                    )
+        if wrapped:
+            policy = json.loads(
+                context.read_file(os.path.join(directory, name, "fp-recovery.json"))
+            )
+            if policy["command"] != command:
+                raise ValueError(
+                    "Existing wrapped FP command differs from machine.json"
+                )
+    missing = set(paths) - set(recovered_names)
+    if any(not validate_vasp(root / name)[0] for name in missing):
+        raise ValueError(
+            "Existing directory lacks unfinished local FP tasks; refusing to create another submission"
+        )
+    submission.existing_remote_root = directory
+    submission.bind_machine(probe.machine)
+    return submission, wrapped, directory
+
+
+def _check_conflicting_campaign(submission, ledger):
+    if (
+        not ledger
+        or not ledger.get("submission_hash")
+        or ledger["submission_hash"] == submission.submission_hash
+    ):
+        return
+    ids = sorted(
+        {
+            str(entry["job_id"])
+            for entry in ledger["tasks"].values()
+            if entry.get("job_id")
+            and entry.get("status") not in ("successful", "failed")
+        }
+    )
+    if not ids:
+        return
+    if any(not re.fullmatch(r"[0-9]+(?:_[0-9]+)?", value) for value in ids):
+        raise RuntimeError(
+            "Another local recovery campaign has unknown job IDs; refusing to abandon it"
+        )
+    code, _, stdout, stderr = submission.machine.context.block_call(
+        "squeue -h -j " + quote(",".join(ids)) + " -o '%i|%T'"
+    )
+    active = _text(stdout).strip()
+    error = _text(stderr)
+    if active or (code and "Invalid job id" not in error):
+        raise RuntimeError(
+            "Another local FP submission may still be active; finish/cancel its jobs before adopting this directory"
+        )
+
+
 def _run_recovery(
     root, jdata, mdata, forward_files, backward_files, log_file="fp.log", common=None
 ):
@@ -515,7 +698,9 @@ def _run_recovery(
     ).hexdigest()
     manifest = root / ".fp-recovery.json"
     ledger = json.loads(manifest.read_text()) if manifest.exists() else None
-    if ledger and ledger["signature"] != signature:
+    explicit = requested_directory(root)
+    locator = explicit or (ledger.get("existing_directory") if ledger else None)
+    if ledger and ledger["signature"] != signature and not explicit:
         raise RuntimeError(
             "FP inputs or submission settings changed; refusing to overwrite or duplicate an existing recovery campaign"
         )
@@ -537,6 +722,50 @@ def _run_recovery(
     if not isinstance(legacy, RecoverySubmission):
         raise ValueError("FP recovery requires batch Slurm execution without --gpus")
     legacy.generate_jobs()
+    if locator:
+        selected, wrapped, directory = _load_existing(
+            legacy, locator, root, paths, command
+        )
+        _check_conflicting_campaign(selected, ledger)
+        if ledger and (
+            ledger.get("submission_hash") != selected.submission_hash
+            or ledger["signature"] != signature
+        ):
+            shutil.copyfile(
+                manifest, root / f".fp-recovery.before-adopt.{time.time_ns()}.json"
+            )
+            ledger = None
+        if ledger is None:
+            ledger = {
+                "version": 1,
+                "signature": signature,
+                "instrumented": wrapped,
+                "tasks": {
+                    name: {"status": "pending", "input_digest": fingerprints[name]}
+                    for name in paths
+                },
+            }
+            for name in paths:
+                valid, reason = validate_vasp(root / name)
+                if valid:
+                    ledger["tasks"][name].update(status="successful", reason=reason)
+        ledger.update(
+            existing_directory=directory,
+            submission_hash=selected.submission_hash,
+            remote_root=directory,
+            instrumented=wrapped,
+        )
+        worker.atomic_json(manifest, ledger)
+        selected.configure_recovery(root, config, ledger, instrumented=wrapped)
+        dlog.info(
+            "FP recovery: explicitly resuming %s; no replacement directory will be created",
+            directory,
+        )
+        return selected.run_submission(
+            clean=False,
+            continue_on_failure=True,
+            check_interval=config["check_interval"],
+        )
     old_exists = legacy.machine.context.check_file_exists(
         f"{legacy.submission_hash}.json"
     )

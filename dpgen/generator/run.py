@@ -4586,8 +4586,9 @@ def run_fp_inner(
 
     ### Submit jobs
     check_api_version(mdata)
-    if jdata.get("fp_recovery", {}).get("enabled", False):
-        from dpgen.dispatcher.fp_recovery import run_recovery
+    from dpgen.dispatcher.fp_recovery import requested_directory, run_recovery
+
+    if jdata.get("fp_recovery", {}).get("enabled", False) or requested_directory(work_path):
 
         return run_recovery(
             work_path, jdata, mdata, forward_files, backward_files,
@@ -6133,7 +6134,9 @@ def gen_run(args):
         dlog.info("start running")
         from dpgen.dispatcher.interactive import interactive_execution
 
-        with interactive_execution(args):
+        from dpgen.dispatcher.fp_recovery import recovery_execution
+
+        with interactive_execution(args), recovery_execution(args):
             run_iter(args.PARAM, args.MACHINE)
         dlog.info("finished")
 

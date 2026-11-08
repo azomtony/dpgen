@@ -342,3 +342,34 @@ before using it again. Allocation is still controlled by Slurm: the controller
 can reject known-bad allocations but cannot force Slurm to assign a particular
 healthy card, so eventual completion depends on healthy resources becoming
 available.
+
+### Explicitly choose an existing FP staging directory
+
+If automatic recovery does not locate the existing submission, give the actual
+staging directory on the configured FP machine:
+
+```bash
+dpgen finetune param.json machine.json \
+  --fp-existing-dir /absolute/path/to/existing/submission-directory
+```
+
+The same option works with `dpgen run`. Supply the directory containing the
+`<40-character-submission-hash>.json` recovery record and `task.*` directories,
+not the parent containing several temporary directories. You can alternatively
+supply the absolute path to that submission JSON file. The option implies FP
+recovery for the selected stage even if `fp_recovery.enabled` was not set.
+
+The record must match the current FP stage, task inputs, command and original
+machine/resource settings. Inputs are checked before staging uploads. Recovery
+restores the saved jobs and job IDs and pins every subsequent bind/upload to
+this directory. A missing record, changed input, incompatible settings or a
+record for another iteration produces an error; it never falls back to creating
+a replacement directory. If another local recovery campaign may still have
+active jobs, it refuses to silently abandon those jobs or create duplicates.
+
+The chosen location persists in `02.fp/.fp-recovery.json`, so later invocations
+with `fp_recovery.enabled: true` reuse it without repeating the flag. The CLI
+selection applies only to the first FP stage reached by that invocation; later
+iterations do not accidentally reuse the old staging directory. Resume while
+`record.dpgen` still points to that iteration's FP work; this option does not
+rewind completed workflow stages.
