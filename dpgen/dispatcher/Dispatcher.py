@@ -18,6 +18,8 @@ def make_submission(
     backward_files,
     outlog,
     errlog,
+    *,
+    submission_class=None,
 ):
     from dpgen.dispatcher.interactive import local_submission
 
@@ -52,7 +54,7 @@ def make_submission(
         )
         task_list.append(task)
 
-    submission = Submission(
+    submission = (submission_class or Submission)(
         work_base=work_path,
         machine=machine,
         resources=resources,

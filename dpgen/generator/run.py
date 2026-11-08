@@ -4586,6 +4586,13 @@ def run_fp_inner(
 
     ### Submit jobs
     check_api_version(mdata)
+    if jdata.get("fp_recovery", {}).get("enabled", False):
+        from dpgen.dispatcher.fp_recovery import run_recovery
+
+        return run_recovery(
+            work_path, jdata, mdata, forward_files, backward_files,
+            log_file=log_file, common=forward_common_files,
+        )
 
     submission = make_submission(
         mdata["fp_machine"],

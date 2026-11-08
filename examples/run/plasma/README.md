@@ -269,3 +269,76 @@ frames can receive few or no FP tasks because failed frames are not ordinary
 training candidates. It reports exposure phases and arrival events. Locating
 uncertainty within physical slab regions (core, edge bath, surface) requires
 per-atom committee output and is not inferred from a global maximum deviation.
+
+## Recover FP jobs without losing completed results
+
+For Slurm VASP jobs, add this top-level section to `param.json`:
+
+```json
+"fp_recovery": {
+  "enabled": true,
+  "max_nonhardware_retries": 2,
+  "hardware_retry_delay": 60,
+  "nonhardware_retry_delay": 60,
+  "check_interval": 30
+}
+```
+
+All delays are seconds. Set `fp.resources.group_size` to `1` in `machine.json`.
+Keep a persistent shared `remote_root` and use batch submission without `--gpus`.
+The FP environment must provide Python 3.9+. This policy is opt-in; other stages
+and ordinary submission behavior remain unchanged.
+
+The controller first probes the original submission identity for an existing
+recovery record. If one exists, it adopts the original jobs, job IDs, and staging
+directory instead of wrapping or resubmitting them. Existing uninstrumented jobs
+cannot retroactively provide GPU UUID telemetry; their scheduler and available
+application diagnostics are still recorded. New FP stages use the instrumented
+worker. Do not change commands, machine/resources settings or scientific inputs
+while adopting an existing campaign. A previously abandoned submission under
+*different* settings is not automatically discovered; restore its original
+settings and recovery records before enabling recovery.
+
+New campaigns skip validated local results. They persist a frozen task list and
+submission identity in `02.fp/.fp-recovery.json`, reattach existing running jobs,
+and download each finished task without waiting for siblings. Validation checks
+normal VASP termination, electronic convergence, a single frame, matching atom
+count/species/geometry, and finite energies and forces. Input fingerprints prevent
+silently reusing results after changing POSCAR, INCAR, POTCAR or KPOINTS.
+
+**Confirmed hardware failures retry without an attempt limit until successful
+or the controller is cancelled.** Evidence includes Slurm `NODE_FAIL`, explicit
+uncorrectable ECC errors and a GPU falling off the bus. Preemption, timeout,
+OOM, convergence errors and unclassified CUDA/application errors do not become
+unlimited hardware retries. Other failures get `max_nonhardware_retries` retries.
+If those are exhausted, remaining jobs are still monitored and their valid
+results preserved, then the stage raises a diagnostic error. This does not
+silently enable partial-data training or weaken the existing failure threshold.
+
+Each retry logs the job ID, available node/partition, failure category and reason.
+Detailed evidence is appended to `02.fp/fp-recovery-history.jsonl`. Each newly
+wrapped task also has `fp-attempt.json` and `fp-runtime.log`. Per-task status,
+retry counters and the unchanged submission location remain in `.fp-recovery.json`.
+Staging directories are retained. Multiple controllers for one FP stage are
+prevented by an exclusive lock. An ambiguous `sbatch` outcome stops with a clear
+message instead of risking duplicate submission; backend job-ID markers and
+saved job IDs are checked before resubmitting.
+
+For an instrumented GPU task, the worker records CUDA-visible device UUIDs and
+preserves the scheduler allocation boundary. A confirmed single-device failure
+is recorded in the workflow-root `.dpgen-gpu-health.json`. Later attempts mask
+known-bad GPUs only when healthy GPUs are already in their allocation. A job
+allocated only known-bad devices exits before VASP and requests another allocation.
+The entire node is **not** automatically excluded. Remove an old manual
+`#SBATCH --exclude=ghpc011` if you intend its healthy GPUs to remain eligible.
+
+For numeric CUDA masks, UUID discovery uses the CUDA runtime when available;
+explicit UUID masks are used directly. CUDA may remap indices, so Slurm/NVML
+numeric IDs alone are never used to select another device. When mapping is
+unavailable, the original scheduler mask is preserved and the limitation logged.
+Multi-GPU error messages do not automatically blame every allocated GPU. Once a
+physical device has been repaired, remove its entry from the GPU-health registry
+before using it again. Allocation is still controlled by Slurm: the controller
+can reject known-bad allocations but cannot force Slurm to assign a particular
+healthy card, so eventual completion depends on healthy resources becoming
+available.

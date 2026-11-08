@@ -309,7 +309,14 @@ class TestPlasma(unittest.TestCase):
         self.assertGreater(len(oxygen_counts), 1)
 
     def test_selection_report_tracks_uncertainty_and_fp_origins(self):
+        import logging
+
         from dpgen import dlog
+
+        # The legacy generator test package disables logging process-wide.
+        previous_disable = logging.root.manager.disable
+        logging.disable(logging.NOTSET)
+        self.addCleanup(logging.disable, previous_disable)
 
         task = self.make()
         self.run_task(task)

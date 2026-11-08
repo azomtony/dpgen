@@ -1146,6 +1146,12 @@ def fp_args() -> list[Argument]:
         ),
         Argument("ratio_failed", float, optional=True, doc=doc_ratio_failed),
         Argument("failed_ratio", float, optional=True, doc=doc_failed_ratio),
+        Argument(
+            "fp_recovery",
+            dict,
+            optional=True,
+            doc="Opt-in Slurm VASP task recovery. Confirmed hardware failures retry without an attempt limit; other failures remain bounded. See FP recovery documentation.",
+        ),
     ]
 
 
