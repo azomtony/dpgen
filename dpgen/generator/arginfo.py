@@ -1147,6 +1147,12 @@ def fp_args() -> list[Argument]:
         Argument("ratio_failed", float, optional=True, doc=doc_ratio_failed),
         Argument("failed_ratio", float, optional=True, doc=doc_failed_ratio),
         Argument(
+            "job_recovery",
+            dict,
+            optional=True,
+            doc="Hardware-aware Slurm recovery for training and LAMMPS exploration; one task per job. Uses the same options as fp_recovery.",
+        ),
+        Argument(
             "fp_recovery",
             dict,
             optional=True,

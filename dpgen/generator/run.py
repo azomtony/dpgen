@@ -991,9 +991,14 @@ def run_train_dp(iter_index, jdata, mdata):
     ### Submit jobs
     check_api_version(mdata)
 
-    submission = make_submission(
+    from dpgen.dispatcher.stage_recovery import make_stage_submission
+
+    submission = make_stage_submission(
+        jdata,
+        "train",
         mdata["train_machine"],
         mdata["train_resources"],
+        ordinary_factory=make_submission,
         commands=commands,
         work_path=work_path,
         run_tasks=run_tasks,
@@ -2458,9 +2463,14 @@ def run_md_model_devi(iter_index, jdata, mdata):
     ### Submit jobs
     check_api_version(mdata)
 
-    submission = make_submission(
+    from dpgen.dispatcher.stage_recovery import make_stage_submission
+
+    submission = make_stage_submission(
+        jdata,
+        "model_devi",
         mdata["model_devi_machine"],
         mdata["model_devi_resources"],
+        ordinary_factory=make_submission,
         commands=commands,
         work_path=work_path,
         run_tasks=run_tasks,
@@ -4588,7 +4598,12 @@ def run_fp_inner(
     check_api_version(mdata)
     from dpgen.dispatcher.fp_recovery import requested_directory, run_recovery
 
-    if jdata.get("fp_recovery", {}).get("enabled", False) or requested_directory(work_path):
+    if (
+        jdata.get("fp_recovery", {}).get(
+            "enabled", jdata.get("job_recovery", {}).get("enabled", False)
+        )
+        or requested_directory(work_path)
+    ):
 
         return run_recovery(
             work_path, jdata, mdata, forward_files, backward_files,

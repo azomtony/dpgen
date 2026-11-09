@@ -63,15 +63,21 @@ def atomic_json(path, value):
     os.replace(temporary, path)
 
 
-def input_digest(root="."):
+def input_digest(root=".", names=None):
     digest = hashlib.sha256()
-    for name in ("POSCAR", "INCAR", "POTCAR", "KPOINTS"):
+    for name in (
+        names if names is not None else ("POSCAR", "INCAR", "POTCAR", "KPOINTS")
+    ):
         path = Path(root) / name
         digest.update(name.encode())
-        if path.exists():
-            with path.open("rb") as stream:
-                for block in iter(lambda: stream.read(1048576), b""):
-                    digest.update(block)
+        paths = sorted(path.rglob("*")) if path.is_dir() else [path]
+        for item in paths:
+            if item.is_file():
+                if path.is_dir():
+                    digest.update(str(item.relative_to(path)).encode())
+                with item.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1048576), b""):
+                        digest.update(block)
     return digest.hexdigest()
 
 
@@ -183,7 +189,7 @@ def run_attempt(
     config_file="fp-recovery.json", run=subprocess.run, popen=subprocess.Popen
 ):
     config = json.loads(Path(config_file).read_text())
-    fingerprint = input_digest()
+    fingerprint = input_digest(names=config.get("input_files"))
     environment = dict(os.environ)
     inventory, inventory_error = gpu_inventory(run)
     visible_uuids, mapping_error = cuda_visible_uuids(environment)
@@ -250,6 +256,8 @@ def run_attempt(
             log.flush()
             print(line, end="", flush=True)
         code = process.wait()
+        if hasattr(process.stdout, "close"):
+            process.stdout.close()
     text = Path("fp-runtime.log").read_text(errors="replace")
     if code:
         category, reason = classify(

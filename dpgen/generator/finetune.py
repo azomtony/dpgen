@@ -423,7 +423,6 @@ def _link_finetune_models(iter_index, jdata):
 def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation):
     from packaging.version import Version
 
-    from dpgen.dispatcher.Dispatcher import make_submission
     from dpgen.generator.lib.utils import check_api_version
     from dpgen.generator.run import (
         default_train_input_file,
@@ -547,9 +546,15 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
 
     check_api_version(mdata)
 
-    submission = make_submission(
+    from dpgen.dispatcher.Dispatcher import make_submission
+    from dpgen.dispatcher.stage_recovery import make_stage_submission
+
+    submission = make_stage_submission(
+        jdata,
+        "train",
         mdata["train_machine"],
         mdata["train_resources"],
+        ordinary_factory=make_submission,
         commands=commands,
         work_path=work_path,
         run_tasks=run_tasks,

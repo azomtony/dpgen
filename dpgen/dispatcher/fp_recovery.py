@@ -77,7 +77,11 @@ DEFAULTS = {
 
 
 def options(jdata):
-    supplied = jdata.get("fp_recovery", {})
+    global_options = jdata.get("job_recovery", {})
+    fp_options = jdata.get("fp_recovery", {})
+    if not isinstance(global_options, dict) or not isinstance(fp_options, dict):
+        raise ValueError("job_recovery and fp_recovery must be objects")
+    supplied = dict(global_options, **fp_options)
     if not isinstance(supplied, dict) or supplied.keys() - DEFAULTS.keys():
         raise ValueError("Invalid fp_recovery options")
     result = dict(DEFAULTS, **supplied)
@@ -229,6 +233,7 @@ class RecoverySubmission(Submission):
     def configure_recovery(
         self, root, config, ledger, validator=validate_vasp, instrumented=True
     ):
+        self.recovery_label = ledger.get("stage", "FP") + " recovery"
         self.recovery_root = Path(root).resolve()
         self.recovery_options = config
         self.recovery_ledger = ledger
@@ -314,7 +319,7 @@ class RecoverySubmission(Submission):
             ]
             if failed:
                 raise RuntimeError(
-                    f"{len(failed)} FP tasks exhausted nonhardware retries. "
+                    f"{len(failed)} {self.recovery_ledger.get('stage', 'FP')} tasks exhausted nonhardware retries. "
                     f"Completed results are preserved in {self.recovery_root}; "
                     "see fp-recovery-history.jsonl for reasons."
                 )
@@ -335,7 +340,7 @@ class RecoverySubmission(Submission):
             "started": time.time(),
         }
         self._save()
-        dlog.info("FP recovery: %s%s", phase, f" ({task})" if task else "")
+        dlog.info("%s: %s%s", self.recovery_label, phase, f" ({task})" if task else "")
 
     def _log_progress(self, interval):
         counts = {}
@@ -349,7 +354,8 @@ class RecoverySubmission(Submission):
         }
         self._save()
         dlog.info(
-            "FP recovery progress: successful=%d/%d running=%d waiting=%d retry_wait=%d pending=%d failed=%d; next check in %s s",
+            "%s progress: successful=%d/%d running=%d waiting=%d retry_wait=%d pending=%d failed=%d; next check in %s s",
+            self.recovery_label,
             counts.get("successful", 0),
             len(self.recovery_ledger["tasks"]),
             counts.get("running", 0) + counts.get("completing", 0),
@@ -453,12 +459,13 @@ class RecoverySubmission(Submission):
             if entry.get("status") == "successful":
                 continue
             self._download_job(job)
-            self._activity("validating VASP results", name)
+            self._activity("validating stage results", name)
             valid, reason = self.recovery_validator(self.recovery_root / name)
             if valid:
                 entry.update(status="successful", job_id=str(job.job_id), reason=reason)
                 dlog.info(
-                    "FP recovery %s: validated success, job=%s; results preserved",
+                    "%s %s: validated success, job=%s; results preserved",
+                    self.recovery_label,
                     name,
                     job.job_id,
                 )
@@ -609,7 +616,8 @@ class RecoverySubmission(Submission):
                 ) as stream:
                     stream.write(json.dumps(diagnostic) + "\n")
                 dlog.warning(
-                    "FP recovery %s job=%s node=%s partition=%s: %s; reason=%s; retry=%s",
+                    "%s %s job=%s node=%s partition=%s: %s; reason=%s; retry=%s",
+                    self.recovery_label,
                     name,
                     job.job_id,
                     diagnostic["scheduler"].get(
@@ -647,10 +655,11 @@ class RecoverySubmission(Submission):
             self._clear_finished_tags(job)
             # Do not use the backend's finite generic retry policy here.
             job.fail_count += 1
-            if hasattr(job, "_ensure_forward_files_on_retry"):
-                job._ensure_forward_files_on_retry()
-            else:
-                self.upload_jobs()
+            if not getattr(self, "preserve_remote_checkpoints", False):
+                if hasattr(job, "_ensure_forward_files_on_retry"):
+                    job._ensure_forward_files_on_retry()
+                else:
+                    self.upload_jobs()
             self._refresh_worker_policy(job, name)
             self._submit_with_intent(job, entry)
             entry.pop("validation_error", None)

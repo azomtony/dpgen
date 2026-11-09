@@ -385,3 +385,58 @@ outputs, validating results, staging pending inputs, or diagnosing a failure.
 The local `.fp-recovery.json` also records the last activity and timestamp.
 Already-submitted jobs do not trigger bulk input restaging during recovery;
 inputs are staged for unsubmitted tasks or restored when a retry needs them.
+
+
+## Hardware recovery for training and exploration
+
+To enable the same hardware retry policy for training, fine-tuning, ordinary
+LAMMPS exploration, plasma exploration, and Slurm VASP labeling, add this at the
+**top level of `param.json`**, alongside `model_devi_jobs` and `fp_task_max`:
+
+```json
+"job_recovery": {
+  "enabled": true,
+  "max_nonhardware_retries": 2,
+  "hardware_retry_delay": 60,
+  "nonhardware_retry_delay": 60,
+  "check_interval": 30
+}
+```
+
+All delays are seconds. Existing `fp_recovery` settings override these defaults
+for FP only. FP still requires `fp.resources.group_size: 1`. Training and
+exploration automatically use one task per submitted job with this option,
+including when their ordinary `group_size` is larger. Resource requests per job
+(such as one GPU) still come from `machine.json`. Use Slurm batch execution,
+without `--gpus`, and a persistent shared staging filesystem accessible from
+replacement nodes. The compute environment needs Python 3.9+.
+
+Confirmed hardware failures retry without a limit. Application, resource,
+configuration, timeout, and unknown failures retain the bounded retry policy.
+Reports include scheduler state, exit status, node, partition and available GPU
+UUID evidence. The workflow shares `.dpgen-gpu-health.json` across stages;
+masking only uses GPUs actually assigned by Slurm. If every allocated GPU is
+known faulty, the attempt exits for another allocation rather than using an
+unallocated GPU.
+
+Rerun the same DP-GEN command with unchanged inputs and resource settings to
+reattach existing recovery jobs. Successful siblings remain preserved. Training
+uses its existing DeePMD checkpoint restart command. Ordinary LAMMPS uses its
+existing restart files and `run ... upto` target; before the first checkpoint,
+it must replay from the start. Plasma retains its event/dose checkpoint logic
+and physical-time target. Retry handling does not upload initial checkpoint or
+trajectory directories over newer remote state.
+
+Enable this option **before submitting a new training or exploration stage**.
+Turning it on for an already submitted ordinary stage is rejected when its
+original submission record is found, to avoid duplicate jobs. The explicit
+`--fp-existing-dir` adoption option remains specific to FP. Other exploration
+engines are not supported by `job_recovery` yet.
+
+The controller checks a successful wrapper receipt matching the input digest
+and nonempty exported model or deviation output. Plasma additionally requires
+`complete` or `trust_stop` status. Normal scientific postprocessing still runs;
+a wrapper receipt does not replace scientific validation. For compatibility,
+shared bookkeeping files retain their `fp` names inside each stage directory:
+`.fp-recovery.json`, `fp-recovery-history.jsonl`, and per-task `fp-attempt.json`
+and `fp-runtime.log`. Progress messages identify the stage.

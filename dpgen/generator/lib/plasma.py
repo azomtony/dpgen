@@ -612,7 +612,6 @@ def select_frames(tasks, job, jdata, system, total_budget):
 def run_tasks(iter_index, jdata, mdata):
     import shlex
 
-    from dpgen.dispatcher.Dispatcher import make_submission
     from dpgen.generator.lib.utils import check_api_version
     from dpgen.generator.run import _get_model_suffix
 
@@ -624,9 +623,15 @@ def run_tasks(iter_index, jdata, mdata):
     command = "python plasma_runtime.py --command " + shlex.quote(
         mdata["model_devi_command"]
     )
-    submission = make_submission(
+    from dpgen.dispatcher.Dispatcher import make_submission
+    from dpgen.dispatcher.stage_recovery import make_stage_submission
+
+    submission = make_stage_submission(
+        jdata,
+        "model_devi",
         mdata["model_devi_machine"],
         mdata["model_devi_resources"],
+        ordinary_factory=make_submission,
         commands=[command],
         work_path=str(root),
         run_tasks=sorted(path.name for path in root.glob("task.*.*")),
