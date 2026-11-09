@@ -251,6 +251,54 @@ class RecoverySubmission(Submission):
             else {"devices": {}}
         )
         self.continue_on_failure = True
+        # Reconsider exhausted jobs when a new classifier recognizes evidence
+        # already saved by an older controller. Keep their scheduler identity.
+        for name, entry in ledger["tasks"].items():
+            diagnostic = entry.get("diagnosis", {})
+            if (
+                entry.get("status") == "successful"
+                or diagnostic.get("category") != "unknown"
+            ):
+                continue
+            category, reason = worker.classify(
+                diagnostic.get("evidence", ""),
+                diagnostic.get("scheduler", {}).get("state", ""),
+            )
+            if category not in worker.UNLIMITED_RETRY_CATEGORIES:
+                continue
+            diagnostic.update(category=category, reason=reason)
+            entry.update(reason=reason, reclassified_at=time.time())
+            entry["nonhardware_failures"] = max(
+                0, entry.get("nonhardware_failures", 0) - 1
+            )
+            counter = (
+                "hardware_failures"
+                if category == "hardware"
+                else "gpu_initialization_failures"
+            )
+            entry[counter] = entry.get(counter, 0) + 1
+            if entry.get("status") == "failed":
+                entry.update(
+                    status="retry_wait",
+                    retry_after=time.time() + config["hardware_retry_delay"],
+                )
+            with (self.recovery_root / "fp-recovery-history.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        dict(
+                            diagnostic,
+                            reclassified_at=entry["reclassified_at"],
+                            previous_category="unknown",
+                        )
+                    )
+                    + "\n"
+                )
+            dlog.warning(
+                "%s %s: saved unknown failure reclassified as %s; retry=unlimited; existing job and outputs preserved",
+                self.recovery_label,
+                name,
+                category,
+            )
 
     def run_submission(
         self, *, clean=False, continue_on_failure=True, check_interval=30
@@ -504,10 +552,10 @@ class RecoverySubmission(Submission):
             backend = ""
         current_evidence = log if self.instrumented else log + "\n" + backend
         category, reason = worker.classify(current_evidence, scheduler.get("state", ""))
-        if attempt.get("category") == "hardware":
-            category, reason = "hardware", attempt["reason"]
+        if attempt.get("category") in worker.UNLIMITED_RETRY_CATEGORIES:
+            category, reason = attempt["category"], attempt["reason"]
         validation_error = self.recovery_ledger["tasks"][name].get("validation_error")
-        if validation_error and category != "hardware":
+        if validation_error and category not in worker.UNLIMITED_RETRY_CATEGORIES:
             category, reason = "application", validation_error
         return {
             "time": time.time(),
@@ -532,6 +580,12 @@ class RecoverySubmission(Submission):
         # task's inputs into the same submission context before retrying.
         self.machine.context.write_file(
             str(Path(name) / "fp-recovery.json"), write_str=json.dumps(policy)
+        )
+        # Refresh instrumentation only before submitting a new attempt. Existing
+        # staging directories may contain the older, broken CUDA UUID lookup.
+        self.machine.context.write_file(
+            str(Path(name) / "fp_recovery_worker.py"),
+            write_str=Path(worker.__file__).read_text(),
         )
 
     def _clear_finished_tags(self, job):
@@ -601,16 +655,22 @@ class RecoverySubmission(Submission):
                 counter = (
                     "hardware_failures"
                     if category == "hardware"
+                    else "gpu_initialization_failures"
+                    if category == "gpu_initialization"
                     else "nonhardware_failures"
                 )
                 entry[counter] = entry.get(counter, 0) + 1
                 delay = self.recovery_options[
                     "hardware_retry_delay"
-                    if category == "hardware"
+                    if category in worker.UNLIMITED_RETRY_CATEGORIES
                     else "nonhardware_retry_delay"
                 ]
                 entry["retry_after"] = time.time() + delay
-                for uuid in diagnostic["attempt"].get("faulty_gpu_uuids", []):
+                for uuid in (
+                    diagnostic["attempt"].get("faulty_gpu_uuids", [])
+                    if category == "hardware"
+                    else []
+                ):
                     self.health["devices"][uuid] = {
                         "node": diagnostic["attempt"].get("node"),
                         "partition": diagnostic["attempt"].get("partition"),
@@ -635,8 +695,8 @@ class RecoverySubmission(Submission):
                     ),
                     category,
                     diagnostic["reason"],
-                    "unlimited hardware"
-                    if category == "hardware"
+                    "unlimited " + category
+                    if category in worker.UNLIMITED_RETRY_CATEGORIES
                     else "bounded nonhardware",
                 )
                 try:
@@ -644,9 +704,11 @@ class RecoverySubmission(Submission):
                 finally:
                     self.submission_to_json()
                     self._save()
-            hardware = entry["diagnosis"]["category"] == "hardware"
+            unlimited = (
+                entry["diagnosis"]["category"] in worker.UNLIMITED_RETRY_CATEGORIES
+            )
             if (
-                not hardware
+                not unlimited
                 and entry.get("nonhardware_failures", 0)
                 > self.recovery_options["max_nonhardware_retries"]
             ):

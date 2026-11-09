@@ -9,7 +9,6 @@ import re
 import subprocess
 import sys
 import time
-import uuid as uuid_module
 from pathlib import Path
 
 HARDWARE_PATTERNS = (
@@ -22,6 +21,9 @@ HARDWARE_PATTERNS = (
 )
 
 
+UNLIMITED_RETRY_CATEGORIES = ("hardware", "gpu_initialization")
+
+
 def classify(text, scheduler_state=""):
     if re.split(r"[ +]", scheduler_state.upper())[0] == "NODE_FAIL":
         return "hardware", "Slurm reports NODE_FAIL"
@@ -29,6 +31,18 @@ def classify(text, scheduler_state=""):
         match = re.search(pattern, text, re.I)
         if match:
             return "hardware", match.group(0)
+    # A context-creation failure precedes the scientific calculation. Error 999
+    # is not proof of a broken physical card (compute-mode/driver failures can
+    # cause it too), so retry without adding any device to the fault registry.
+    if re.search(
+        r"\bcuCtxCreate(?:_v\d+)?\b[^\n]*(?:CUDA_ERROR_UNKNOWN|(?:error\s+|returned\s+)999\b)",
+        text,
+        re.I,
+    ):
+        return (
+            "gpu_initialization",
+            "CUDA context creation failed with error 999; physical GPU fault is unconfirmed",
+        )
     lower = text.lower()
     if "out of memory" in lower or "out_of_memory" in lower or "oom-kill" in lower:
         return "resource", "Out of memory; not proof of faulty hardware"
@@ -86,7 +100,7 @@ def gpu_inventory(run=subprocess.run):
         result = run(
             [
                 "nvidia-smi",
-                "--query-gpu=index,uuid,pci.bus_id",
+                "--query-gpu=index,uuid,pci.bus_id,mig.mode.current",
                 "--format=csv,noheader",
             ],
             capture_output=True,
@@ -98,68 +112,122 @@ def gpu_inventory(run=subprocess.run):
         if result.returncode == 0:
             for line in result.stdout.splitlines():
                 parts = [part.strip() for part in line.split(",")]
-                if len(parts) == 3:
-                    rows.append(
-                        dict(index=parts[0], uuid=parts[1], pci_bus_id=parts[2])
-                    )
-        return rows, result.stderr.strip()
+                if len(parts) in (3, 4):
+                    row = dict(index=parts[0], uuid=parts[1], pci_bus_id=parts[2])
+                    if len(parts) == 4:
+                        row["mig_mode"] = parts[3]
+                    rows.append(row)
+        return rows, result.stderr.strip() or (
+            result.stdout.strip() if result.returncode else ""
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return [], str(exc)
 
 
-def cuda_visible_uuids(environment):
-    """Ask CUDA itself for identities after allocation remapping; never guess."""
+def pci_identity(value):
+    """Normalize CUDA's four-digit and NVML's eight-digit PCI domains."""
+    match = re.fullmatch(
+        r"([0-9a-f]+):([0-9a-f]+):([0-9a-f]+)\.([0-9a-f]+)", value.strip(), re.I
+    )
+    return tuple(int(part, 16) for part in match.groups()) if match else None
+
+
+def cuda_visible_uuids(environment, inventory=None):
+    """Resolve allocation-scoped CUDA ordinals through PCI IDs, never NVML indices."""
     visible = environment.get("CUDA_VISIBLE_DEVICES")
     if not visible or visible == "-1":
         return (
             None,
             "No allocation-scoped CUDA_VISIBLE_DEVICES; GPU identity is unknown",
         )
-    if any(token.strip().startswith(("GPU-", "MIG-")) for token in visible.split(",")):
-        return [token.strip() for token in visible.split(",") if token.strip()], ""
+    tokens = [token.strip() for token in visible.split(",") if token.strip()]
+    if tokens and all(token.startswith(("GPU-", "MIG-")) for token in tokens):
+        return tokens, ""
+    if any(not token.isdigit() for token in tokens):
+        return (
+            None,
+            "Mixed or unsupported CUDA device mask; preserving the scheduler mask",
+        )
+    inventory = gpu_inventory()[0] if inventory is None else inventory
     candidates = [
         ctypes.util.find_library("cudart"),
         "libcudart.so",
+        "libcudart.so.13",
         "libcudart.so.12",
         "libcudart.so.11.0",
     ]
+    errors = []
     for library in candidates:
         if not library:
             continue
         try:
             runtime = ctypes.CDLL(library)
-            count = ctypes.c_int()
             runtime.cudaGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
             runtime.cudaGetDeviceCount.restype = ctypes.c_int
+            runtime.cudaDeviceGetPCIBusId.argtypes = [
+                ctypes.POINTER(ctypes.c_char),
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            runtime.cudaDeviceGetPCIBusId.restype = ctypes.c_int
+            count = ctypes.c_int()
             status = runtime.cudaGetDeviceCount(ctypes.byref(count))
             if status:
-                message = (
+                return (
+                    None,
                     "uncorrectable ECC error"
                     if status == 214
-                    else f"CUDA runtime enumeration failed with code {status}"
+                    else f"CUDA runtime enumeration failed with code {status}",
                 )
-                return None, message
-
-            class UUID(ctypes.Structure):
-                _fields_ = [("bytes", ctypes.c_ubyte * 16)]
-
-            runtime.cudaDeviceGetUuid.argtypes = [ctypes.POINTER(UUID), ctypes.c_int]
-            runtime.cudaDeviceGetUuid.restype = ctypes.c_int
+            if count.value != len(tokens):
+                return (
+                    None,
+                    "CUDA-visible device count differs from the scheduler mask; identity is unknown",
+                )
             identities = []
             for device in range(count.value):
-                identity = UUID()
-                status = runtime.cudaDeviceGetUuid(ctypes.byref(identity), device)
+                bus = ctypes.create_string_buffer(32)
+                status = runtime.cudaDeviceGetPCIBusId(bus, len(bus), device)
                 if status:
-                    return None, f"CUDA device UUID query failed with code {status}"
-                identities.append(
-                    "GPU-" + str(uuid_module.UUID(bytes=bytes(identity.bytes)))
+                    return None, f"CUDA PCI bus query failed with code {status}"
+                pci = pci_identity(bus.value.decode("ascii"))
+                matches = [
+                    row
+                    for row in inventory
+                    if pci is not None and pci_identity(row["pci_bus_id"]) == pci
+                ]
+                if len(matches) != 1:
+                    return (
+                        None,
+                        "CUDA PCI bus ID has no unique match in the NVML inventory",
+                    )
+                row = matches[0]
+                # A physical UUID would widen a numeric MIG allocation to the
+                # entire card. Require a known non-MIG configuration for this
+                # fallback; explicit MIG UUIDs are handled above.
+                if row.get("mig_mode") not in (
+                    "Disabled",
+                    "N/A",
+                    "[N/A]",
+                    "Not Supported",
+                ):
+                    return (
+                        None,
+                        "PCI lookup cannot safely distinguish MIG instances; preserving the scheduler mask",
+                    )
+                identities.append(row["uuid"])
+            if len(set(identities)) != len(identities):
+                return (
+                    None,
+                    "CUDA devices map to a shared physical GPU; preserving the scheduler mask",
                 )
             return identities, ""
-        except (OSError, AttributeError):
-            continue
+        except (OSError, AttributeError) as exc:
+            errors.append(f"{library}: {exc}")
     return (
         None,
-        "CUDA runtime UUID query unavailable; preserving the scheduler device mask without guessing physical indices",
+        "CUDA runtime PCI query unavailable; preserving the scheduler mask. "
+        + "; ".join(errors[-3:]),
     )
 
 
@@ -192,7 +260,7 @@ def run_attempt(
     fingerprint = input_digest(names=config.get("input_files"))
     environment = dict(os.environ)
     inventory, inventory_error = gpu_inventory(run)
-    visible_uuids, mapping_error = cuda_visible_uuids(environment)
+    visible_uuids, mapping_error = cuda_visible_uuids(environment, inventory)
     allocated = allocated_gpus(inventory, environment, visible_uuids)
     report = {
         "started": time.time(),
@@ -201,6 +269,16 @@ def run_attempt(
         "node": environment.get("SLURMD_NODENAME", environment.get("HOSTNAME")),
         "input_digest": fingerprint,
         "allocated_gpus": allocated,
+        "gpu_inventory": inventory,
+        "gpu_identity_source": "explicit_uuid_mask"
+        if visible_uuids
+        and all(
+            token.strip().startswith(("GPU-", "MIG-"))
+            for token in environment.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        )
+        else "cuda_pci_bus_id"
+        if visible_uuids
+        else "unresolved",
         "cuda_visible_devices": environment.get("CUDA_VISIBLE_DEVICES"),
         "slurm_job_gpus": environment.get("SLURM_JOB_GPUS"),
         "slurm_step_gpus": environment.get("SLURM_STEP_GPUS"),

@@ -446,3 +446,61 @@ a wrapper receipt does not replace scientific validation. For compatibility,
 shared bookkeeping files retain their `fp` names inside each stage directory:
 `.fp-recovery.json`, `fp-recovery-history.jsonl`, and per-task `fp-attempt.json`
 and `fp-runtime.log`. Progress messages identify the stage.
+
+### CUDA context creation error 999
+
+`cuCtxCreate ... error 999 (CUDA_ERROR_UNKNOWN)` is classified separately as
+`gpu_initialization`. It retries without an attempt limit, using
+`hardware_retry_delay`, across all recovery-enabled stages. It is not treated as
+proof of a physically faulty GPU: driver or compute-mode problems can also
+prevent context creation (see [NVIDIA's context creation documentation](https://docs.nvidia.com/cuda/archive/12.9.0/cuda-driver-api/group__CUDA__CTX.html)).
+Generic `CUDA_ERROR_UNKNOWN` messages elsewhere, CUDA out-of-memory, and illegal
+memory accesses do not receive this special policy.
+
+On restarting the controller with updated code, saved `unknown` diagnoses whose
+captured evidence matches this pattern are reclassified. Exhausted matching tasks
+become eligible for retry again, retaining the existing submission identity,
+completed results and checkpoints. No manual ledger edits or staging-directory
+deletion are needed. Reclassification is logged in the recovery history.
+
+GPU initialization failures do not populate the confirmed-fault GPU blacklist.
+In particular, when runtime UUID lookup is unavailable, do not infer a physical
+GPU from differing `CUDA_VISIBLE_DEVICES` and `SLURM_JOB_GPUS` numeric values.
+Retrying this failure does not guarantee avoidance of that physical GPU; device
+avoidance still requires an authoritative UUID and confirmed hardware evidence.
+
+### Identify the physical GPU used by an attempt
+
+The worker records `node`, `allocated_gpus` (physical UUID, NVML index and PCI bus
+ID), `selected_gpu_uuids`, `gpu_identity_source`, and the full `gpu_inventory` in
+`fp-attempt.json`. Treat the inventory as a list of devices, not proof that all
+of them were allocated to the job.
+
+For numeric CUDA masks, the worker asks the CUDA runtime for each visible
+ordinal's PCI bus ID with `cudaDeviceGetPCIBusId`, then uniquely matches that PCI
+address to the NVML inventory. It normalizes PCI domain formatting and does not
+assume that CUDA, Slurm and NVML numeric indices match. This replaces the earlier
+lookup that incorrectly expected a `cudaDeviceGetUuid` runtime symbol. PCI-only
+mapping is refused for enabled or unknown MIG mode, since a physical parent UUID
+must not replace a MIG allocation's mask. Explicit scheduler-provided MIG UUIDs
+remain supported.
+
+Instrumentation is refreshed before submitting an instrumented retry, so an
+existing recovery staging directory can receive the corrected worker without
+changing scientific inputs, scheduler identity, or checkpoints. Already running
+attempts are left alone. After updating the cluster code and restarting the
+controller, inspect the next attempt's report, for example from `02.fp`:
+
+```bash
+python3 -m json.tool task.019.000007/fp-attempt.json
+```
+
+If CUDA enumeration is itself broken or the runtime library cannot be loaded,
+identity remains unresolved and the scheduler's device mask is preserved. In
+that case a cluster administrator can correlate the saved job ID and node with
+the site's GRES-to-device mapping. On Slurm versions supporting it,
+[`Flags=env_uuid` with AutoDetect](https://slurm.schedmd.com/gres.conf.html)
+provides UUID-based `CUDA_VISIBLE_DEVICES`, allowing identity capture even when
+CUDA cannot initialize. This is a cluster setting, not a `param.json` setting.
+Identification of the assigned physical GPU is separate from proving that the
+card is faulty; error 999 alone still does not trigger device blacklisting.

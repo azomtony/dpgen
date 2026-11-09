@@ -878,3 +878,184 @@ class TestFPRecovery(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(RuntimeError, "Another controller"):
                 recovery.run_recovery(self.root, {}, {}, [], [])
+
+    def test_cuda_context_unknown_is_initialization_not_confirmed_hardware(self):
+        message = "Accelerator Fatal Error: call to cuCtxCreate returned error 999 (CUDA_ERROR_UNKNOWN): Unknown"
+        self.assertEqual(worker.classify(message)[0], "gpu_initialization")
+        self.assertEqual(worker.classify("CUDA_ERROR_UNKNOWN: 999")[0], "unknown")
+        self.assertNotIn(
+            worker.classify("cuCtxCreate returned CUDA_ERROR_OUT_OF_MEMORY")[0],
+            worker.UNLIMITED_RETRY_CATEGORIES,
+        )
+        self.assertNotIn(
+            worker.classify("CUDA illegal memory access")[0],
+            worker.UNLIMITED_RETRY_CATEGORIES,
+        )
+
+    def test_gpu_initialization_retries_are_unlimited_without_blacklisting(self):
+        task, job = task_job("task.019.000000")
+        submission = self.submission([job], instrumented=True)
+        submission._diagnose = Mock(
+            return_value={
+                "category": "gpu_initialization",
+                "reason": "CUDA context creation failed with error 999",
+                "scheduler": {"node": "ghpc011"},
+                "attempt": {"faulty_gpu_uuids": ["GPU-unconfirmed"]},
+            }
+        )
+        for _ in range(12):
+            job.job_state = JobStatus.terminated
+            submission.handle_unexpected_submission_state(continue_on_failure=True)
+        self.assertEqual(job.submit_job.call_count, 12)
+        entry = submission.recovery_ledger["tasks"][task.task_work_path]
+        self.assertEqual(entry["gpu_initialization_failures"], 12)
+        self.assertEqual(entry.get("nonhardware_failures", 0), 0)
+        self.assertEqual(submission.health["devices"], {})
+
+    def test_exhausted_unknown_context_failure_is_reopened_without_new_job_identity(
+        self,
+    ):
+        task, job = task_job("task.019.000000")
+        submission = self.submission([job], instrumented=True)
+        ledger = submission.recovery_ledger
+        entry = ledger["tasks"][task.task_work_path]
+        entry.update(
+            status="failed",
+            nonhardware_failures=3,
+            job_id="1",
+            last_failure_job_id="1",
+            diagnosis={
+                "task": task.task_work_path,
+                "job_id": "1",
+                "category": "unknown",
+                "scheduler": {},
+                "attempt": {},
+                "evidence": "call to cuCtxCreate returned error 999 (CUDA_ERROR_UNKNOWN): Unknown",
+            },
+        )
+        successful = self.root / "completed-output"
+        successful.write_text("preserved")
+        submission.configure_recovery(
+            self.root, submission.recovery_options, ledger, instrumented=True
+        )
+        self.assertEqual(entry["status"], "retry_wait")
+        self.assertEqual(entry["diagnosis"]["category"], "gpu_initialization")
+        self.assertEqual(entry["job_id"], "1")
+        self.assertEqual(successful.read_text(), "preserved")
+        submission.handle_unexpected_submission_state(continue_on_failure=True)
+        job.submit_job.assert_called_once()
+        self.assertEqual(submission.health["devices"], {})
+        # Reopening must happen only once; no repeated counter adjustments.
+        submission.configure_recovery(
+            self.root, submission.recovery_options, ledger, instrumented=True
+        )
+        self.assertEqual(entry["nonhardware_failures"], 2)
+        self.assertEqual(entry["gpu_initialization_failures"], 1)
+
+    def cuda_runtime(self, bus="0000:65:00.0", status=0):
+        def count(pointer):
+            pointer._obj.value = 1
+            return status
+
+        def pci(buffer, length, ordinal):
+            self.assertEqual(ordinal, 0)  # CUDA-local, not SLURM_JOB_GPUS/NVML.
+            buffer.value = bus.encode()
+            return 0
+
+        return SimpleNamespace(
+            cudaGetDeviceCount=Mock(side_effect=count),
+            cudaDeviceGetPCIBusId=Mock(side_effect=pci),
+        )
+
+    def test_cuda_pci_lookup_maps_local_zero_to_physical_uuid(self):
+        runtime = self.cuda_runtime()
+        inventory = [
+            {
+                "index": "0",
+                "uuid": "GPU-other",
+                "pci_bus_id": "00000000:12:00.0",
+                "mig_mode": "Disabled",
+            },
+            {
+                "index": "7",
+                "uuid": "GPU-allocated",
+                "pci_bus_id": "00000000:65:00.0",
+                "mig_mode": "Disabled",
+            },
+        ]
+        with (
+            patch.object(worker.ctypes, "CDLL", return_value=runtime),
+            patch.object(
+                worker.ctypes.util, "find_library", return_value="libcudart.so"
+            ),
+        ):
+            result, error = worker.cuda_visible_uuids(
+                {"CUDA_VISIBLE_DEVICES": "0", "SLURM_JOB_GPUS": "1"}, inventory
+            )
+        self.assertEqual(result, ["GPU-allocated"])
+        self.assertEqual(error, "")
+        self.assertFalse(hasattr(runtime, "cudaDeviceGetUuid"))
+
+    def test_failed_cuda_enumeration_does_not_guess_physical_index(self):
+        with (
+            patch.object(
+                worker.ctypes, "CDLL", return_value=self.cuda_runtime(status=999)
+            ),
+            patch.object(
+                worker.ctypes.util, "find_library", return_value="libcudart.so"
+            ),
+        ):
+            result, error = worker.cuda_visible_uuids(
+                {"CUDA_VISIBLE_DEVICES": "0", "SLURM_JOB_GPUS": "1"},
+                [
+                    {
+                        "index": "1",
+                        "uuid": "GPU-not-verified",
+                        "pci_bus_id": "00000000:65:00.0",
+                        "mig_mode": "Disabled",
+                    }
+                ],
+            )
+        self.assertIsNone(result)
+        self.assertIn("999", error)
+
+    def test_pci_lookup_never_widens_mig_allocation(self):
+        for mode in ("Enabled", None):
+            with (
+                self.subTest(mode=mode),
+                patch.object(worker.ctypes, "CDLL", return_value=self.cuda_runtime()),
+                patch.object(
+                    worker.ctypes.util, "find_library", return_value="libcudart.so"
+                ),
+            ):
+                result, error = worker.cuda_visible_uuids(
+                    {"CUDA_VISIBLE_DEVICES": "0"},
+                    [
+                        {
+                            "index": "0",
+                            "uuid": "GPU-parent",
+                            "pci_bus_id": "00000000:65:00.0",
+                            "mig_mode": mode,
+                        }
+                    ],
+                )
+            self.assertIsNone(result)
+            self.assertIn("MIG", error)
+        self.assertEqual(
+            worker.cuda_visible_uuids({"CUDA_VISIBLE_DEVICES": "MIG-assigned"}, []),
+            (["MIG-assigned"], ""),
+        )
+
+    def test_retry_refreshes_old_remote_worker(self):
+        task, job = task_job("task.019.000000", state=JobStatus.unsubmitted)
+        submission = self.submission([job], instrumented=True)
+        submission.machine.context.files[
+            task.task_work_path + "/fp_recovery_worker.py"
+        ] = "old worker"
+        submission.handle_unexpected_submission_state(continue_on_failure=True)
+        updated = submission.machine.context.files[
+            task.task_work_path + "/fp_recovery_worker.py"
+        ]
+        self.assertIn("cudaDeviceGetPCIBusId", updated)
+        self.assertNotIn("runtime.cudaDeviceGetUuid", updated)
+        job.submit_job.assert_called_once()
