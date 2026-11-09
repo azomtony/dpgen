@@ -235,3 +235,38 @@ class TestStageRecovery(unittest.TestCase):
             self.data, "train", self.machine, self.resources, **builder
         )
         self.assertEqual(first.submission_hash, second.submission_hash)
+
+    def test_adopts_ordinary_training_and_preserves_job_id(self):
+        from dpgen.dispatcher.Dispatcher import make_submission
+
+        original = make_submission(self.machine, self.resources, **self.builder)
+        original.generate_jobs()
+        original.upload_jobs()
+        original.belonging_jobs[0].job_id = "98765"
+        original.belonging_jobs[0].job_state = JobStatus.running
+        original.submission_to_json()
+        adopted = self.make()
+        self.assertFalse(adopted.instrumented)
+        self.assertEqual(adopted.belonging_jobs[0].job_id, "98765")
+        self.assertEqual(adopted.submission_hash, original.submission_hash)
+        self.assertEqual(
+            adopted.machine.context.remote_root, original.machine.context.remote_root
+        )
+        resumed = self.make()
+        self.assertEqual(resumed.belonging_jobs[0].job_id, "98765")
+        (self.task / "frozen_model.pt").write_bytes(b"export")
+        self.assertTrue(resumed.recovery_validator(self.task)[0])
+
+    def test_adoption_rejects_changed_training_input(self):
+        from dpgen.dispatcher.Dispatcher import make_submission
+
+        self.machine["remote_profile"] = {"symlink": False}
+        original = make_submission(self.machine, self.resources, **self.builder)
+        original.generate_jobs()
+        original.upload_jobs()
+        original.belonging_jobs[0].job_state = JobStatus.unsubmitted
+        original.submission_to_json()
+        (self.task / "input.json").write_text('{"changed": true}')
+        with self.assertRaisesRegex(RuntimeError, "inputs differ"):
+            self.make()
+        self.assertFalse((self.root / ".fp-recovery.json").exists())

@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
+from shlex import quote
 
 from dpgen import dlog
 from dpgen.dispatcher import fp_recovery_worker as worker
@@ -27,7 +28,7 @@ class StageSubmission(RecoverySubmission):
             )
 
 
-def validate_result(task, fingerprint, artifacts, plasma=False):
+def validate_result(task, fingerprint, artifacts, plasma=False, require_receipt=True):
     """Require a successful instrumented attempt and its expected outputs.
 
     Scientific parsing remains in the normal stage postprocessing. A stale
@@ -35,11 +36,12 @@ def validate_result(task, fingerprint, artifacts, plasma=False):
     """
     task = Path(task)
     try:
-        report = json.loads((task / "fp-attempt.json").read_text())
-        if report.get("input_digest") != fingerprint:
-            return False, "Attempt does not match the campaign inputs"
-        if report.get("status") != "exited" or report.get("exit_code") != 0:
-            return False, "Application has not completed successfully"
+        if require_receipt:
+            report = json.loads((task / "fp-attempt.json").read_text())
+            if report.get("input_digest") != fingerprint:
+                return False, "Attempt does not match the campaign inputs"
+            if report.get("status") != "exited" or report.get("exit_code") != 0:
+                return False, "Application has not completed successfully"
         for pattern in artifacts:
             if not any(p.is_file() and p.stat().st_size for p in task.glob(pattern)):
                 return False, f"Missing or empty stage output: {pattern}"
@@ -110,25 +112,73 @@ def make_stage_submission(
         raise RuntimeError(
             "Stage inputs or resources changed; refusing to duplicate an existing recovery campaign"
         )
-    if ledger is None:
-        # Do not silently replace an older ordinary submission, whose jobs may
-        # still be active. Adoption of those identities needs explicit handling.
-        legacy = make_submission(machine, resources, **original_builder)
-        legacy.generate_jobs()
-        if legacy.machine.context.check_file_exists(f"{legacy.submission_hash}.json"):
-            raise RuntimeError(
-                "An ordinary submission already exists for this stage; finish it before enabling job_recovery"
+    legacy = None
+    if ledger is None or not ledger.get("instrumented", True):
+        legacy_builder = dict(
+            ledger.get("legacy_builder", original_builder)
+            if ledger
+            else original_builder
+        )
+        legacy = make_submission(
+            machine, resources, submission_class=StageSubmission, **legacy_builder
+        )
+        if not isinstance(legacy, StageSubmission):
+            raise ValueError(
+                "job_recovery requires batch Slurm execution without --gpus"
             )
+        legacy.generate_jobs()
+        exists = legacy.machine.context.check_file_exists(
+            f"{legacy.submission_hash}.json"
+        )
+        if exists:
+            legacy.try_recover_from_json()
+            expected = {}
+            for name in paths:
+                for filename in input_files:
+                    local = root / name / filename
+                    files = sorted(local.rglob("*")) if local.is_dir() else [local]
+                    for item in files:
+                        if item.is_file():
+                            relative = str(item.relative_to(root))
+                            expected[relative] = hashlib.sha256(
+                                item.read_bytes()
+                            ).hexdigest()
+            script = (
+                "import hashlib,json; from pathlib import Path; "
+                f"print(json.dumps({{p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in {list(expected)!r}}}))"
+            )
+            code, _, stdout, _ = legacy.machine.context.block_call(
+                "python3 -c " + quote(script)
+            )
+            from dpgen.dispatcher.fp_recovery import _text
+
+            if code or json.loads(_text(stdout)) != expected:
+                raise RuntimeError(
+                    "Existing stage inputs differ; refusing to overwrite or resubmit"
+                )
+            if any(len(job.job_task_list) != 1 for job in legacy.belonging_jobs):
+                raise RuntimeError(
+                    "Existing grouped submission cannot be adopted safely; recovery currently requires one task per existing job"
+                )
+        elif ledger is not None:
+            raise RuntimeError(
+                "Existing recovery submission record is missing; refusing to create replacement jobs"
+            )
+        else:
+            legacy = None
+    if ledger is None:
         ledger = {
             "version": 1,
             "signature": signature,
-            "instrumented": True,
+            "instrumented": legacy is None,
             "stage": stage,
             "tasks": {
                 name: {"status": "pending", "input_digest": fingerprints[name]}
                 for name in paths
             },
         }
+        if legacy is not None:
+            ledger["legacy_builder"] = original_builder
         worker.atomic_json(manifest, ledger)
     for name in paths:
         task = root / name
@@ -145,7 +195,9 @@ def make_stage_submission(
         + ["fp-attempt.json", "fp-runtime.log"],
         submission_class=StageSubmission,
     )
-    submission = make_submission(machine, dict(resources, group_size=1), **arguments)
+    submission = legacy or make_submission(
+        machine, dict(resources, group_size=1), **arguments
+    )
     if not isinstance(submission, StageSubmission):
         raise ValueError("job_recovery requires batch Slurm execution without --gpus")
     if stage == "train":
@@ -170,9 +222,22 @@ def make_stage_submission(
         config,
         ledger,
         validator=lambda task: validate_result(
-            task, fingerprints[Path(task).name], artifacts, plasma
+            task,
+            fingerprints[Path(task).name],
+            artifacts,
+            plasma,
+            require_receipt=ledger["instrumented"],
         ),
+        instrumented=ledger["instrumented"],
     )
+    submission.recovery_log_file = builder["outlog"]
+    if not ledger["instrumented"]:
+        dlog.info(
+            "%s: adopting existing submission %s in %s; preserving jobs and checkpoints. Existing jobs have no GPU wrapper telemetry.",
+            stage,
+            submission.submission_hash,
+            submission.machine.context.remote_root,
+        )
     # Preserve the staged inputs and all remote checkpoints on retries.
     # Uploading initial checkpoint directories would roll back MD.
     submission.preserve_remote_checkpoints = True

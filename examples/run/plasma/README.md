@@ -427,11 +427,17 @@ it must replay from the start. Plasma retains its event/dose checkpoint logic
 and physical-time target. Retry handling does not upload initial checkpoint or
 trajectory directories over newer remote state.
 
-Enable this option **before submitting a new training or exploration stage**.
-Turning it on for an already submitted ordinary stage is rejected when its
-original submission record is found, to avoid duplicate jobs. The explicit
-`--fp-existing-dir` adoption option remains specific to FP. Other exploration
-engines are not supported by `job_recovery` yet.
+Existing ordinary training or exploration submissions are adopted when the
+original submission record is found and each existing job contains one task.
+Recovery keeps the original command, resources, job IDs, and staging directory;
+it verifies that the staged inputs match before continuing. Those older jobs
+have no wrapper receipt or GPU UUID telemetry, so success requires the saved
+scheduler completion plus expected outputs, and failure diagnosis uses scheduler
+records and the stage application log. New stages use the instrumented wrapper.
+Existing jobs grouping multiple tasks are rejected rather than split into
+potentially duplicate jobs. Keep the original inputs and machine settings.
+The explicit `--fp-existing-dir` adoption option remains specific to FP. Other
+exploration engines are not supported by `job_recovery` yet.
 
 The controller checks a successful wrapper receipt matching the input digest
 and nonempty exported model or deviation output. Plasma additionally requires

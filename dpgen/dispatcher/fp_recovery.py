@@ -203,9 +203,14 @@ class RecoverySubmission(Submission):
             task for job in restored.belonging_jobs for task in job.job_task_list
         ]
         for job in restored.belonging_jobs:
-            job.job_state = JobStatus(job.job_state)
+            state = job.job_state
+            if state is None:
+                state = JobStatus.waiting if job.job_id else JobStatus.unsubmitted
+            job.job_state = JobStatus(state)
             for task in job.job_task_list:
-                task.task_state = JobStatus(getattr(task, "task_state", job.job_state))
+                task.task_state = JobStatus(
+                    getattr(task, "task_state", None) or job.job_state
+                )
         restored.bind_machine(machine, bind_context=bind_context)
         return restored
 
@@ -489,7 +494,9 @@ class RecoverySubmission(Submission):
         if self.instrumented and not attempt:
             log = ""
         elif not log and not self.instrumented:
-            log = self._read_remote(Path(name) / "fp.log")[-16000:]
+            log = self._read_remote(
+                Path(name) / getattr(self, "recovery_log_file", "fp.log")
+            )[-16000:]
         try:
             reader = getattr(job, "get_last_error_message", None)
             backend = (reader() or "") if callable(reader) else ""
