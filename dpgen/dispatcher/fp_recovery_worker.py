@@ -317,6 +317,27 @@ def run_attempt(
         archive = Path("fp-attempts")
         archive.mkdir(exist_ok=True)
         os.replace("fp-runtime.log", archive / f"{time.time_ns()}.log")
+    monitor = None
+    if config.get("fp_monitor", {}).get("enabled", False):
+        if __package__:
+            from .fp_vasp_monitor import Monitor
+        else:
+            from fp_vasp_monitor import Monitor
+        try:
+            monitor = Monitor(config["fp_monitor"])
+        except (ValueError, OSError) as exc:
+            report.update(
+                status="failed",
+                category="configuration",
+                reason=str(exc),
+                exit_code=2,
+                finished=time.time(),
+            )
+            atomic_json("fp-attempt.json", report)
+            print(f"FP monitor configuration error: {exc}", flush=True)
+            return 2
+    report["fp_monitor_enabled"] = monitor is not None
+    atomic_json("fp-attempt.json", report)
     with Path("fp-runtime.log").open("w") as log:
         process = popen(
             config["command"],
@@ -326,16 +347,24 @@ def run_attempt(
             text=True,
             env=environment,
             executable="/bin/bash",
-            start_new_session=False,
+            start_new_session=monitor is not None,
         )
         assert process.stdout is not None
-        for line in process.stdout:
-            log.write(line)
-            log.flush()
-            print(line, end="", flush=True)
-        code = process.wait()
-        if hasattr(process.stdout, "close"):
-            process.stdout.close()
+        if monitor is not None:
+            monitor.start(process)
+        try:
+            for line in process.stdout:
+                log.write(line)
+                log.flush()
+                print(line, end="", flush=True)
+                if monitor is not None:
+                    monitor.feed(line)
+            code = process.wait()
+        finally:
+            if monitor is not None:
+                monitor.close()
+            if hasattr(process.stdout, "close"):
+                process.stdout.close()
     text = Path("fp-runtime.log").read_text(errors="replace")
     if code:
         category, reason = classify(
@@ -348,6 +377,20 @@ def run_attempt(
             "Application exited successfully; controller must validate scientific results",
             "exited",
         )
+    if monitor is not None and monitor.reason:
+        if category not in UNLIMITED_RETRY_CATEGORIES:
+            category, reason, status = "scientific_stop", monitor.reason, "failed"
+            code = code or 86
+            report["scf_monitor"] = {
+                "reason": monitor.reason,
+                "last_step": monitor.last_step,
+                "termination_signal": monitor.termination,
+            }
+        else:
+            # Preserve hardware retry policy; do not leave a monitor-owned
+            # STOPCAR to abort a replacement allocation on launch.
+            Path("fp-monitor-stop.json").unlink(missing_ok=True)
+            Path("STOPCAR").unlink(missing_ok=True)
     report.update(
         status=status,
         category=category,

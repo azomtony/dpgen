@@ -1059,3 +1059,111 @@ class TestFPRecovery(unittest.TestCase):
         self.assertIn("cudaDeviceGetPCIBusId", updated)
         self.assertNotIn("runtime.cudaDeviceGetUuid", updated)
         job.submit_job.assert_called_once()
+
+    def test_scientific_stop_is_discarded_without_retry(self):
+        task, job = task_job("task.019.000000")
+        submission = self.submission([job], instrumented=True)
+        submission._diagnose = Mock(
+            return_value={
+                "category": "scientific_stop",
+                "reason": "SCF stagnation",
+                "scheduler": {},
+                "attempt": {},
+            }
+        )
+        submission.handle_unexpected_submission_state(continue_on_failure=True)
+        entry = submission.recovery_ledger["tasks"][task.task_work_path]
+        self.assertEqual(entry["status"], "discarded")
+        self.assertEqual(entry["scientific_stops"], 1)
+        job.submit_job.assert_not_called()
+        submission.handle_unexpected_submission_state(continue_on_failure=True)
+        job.submit_job.assert_not_called()
+        self.assertEqual(submission.health["devices"], {})
+
+    def test_monitor_stop_marker_survives_interrupted_worker_report(self):
+        task, job = task_job("task.019.000000")
+        submission = self.submission([job], instrumented=True)
+        submission.fp_monitor_options = {"enabled": True}
+        submission.machine.context.files[task.task_work_path + "/fp-attempt.json"] = (
+            json.dumps({"job_id": "1", "status": "running"})
+        )
+        submission.machine.context.files[
+            task.task_work_path + "/fp-monitor-stop.json"
+        ] = json.dumps({"job_id": "1", "reason": "SCF stagnation"})
+        self.assertEqual(
+            submission._diagnose(job, task.task_work_path)["category"],
+            "scientific_stop",
+        )
+        submission.machine.context.files[
+            task.task_work_path + "/fp-monitor-stop.json"
+        ] = json.dumps({"job_id": "old", "reason": "SCF stagnation"})
+        self.assertEqual(
+            submission._diagnose(job, task.task_work_path)["category"], "unknown"
+        )
+
+    def test_all_scientific_stops_complete_dispatch_without_retry(self):
+        task, job = task_job("task.019.000000")
+        submission = self.submission([job], instrumented=True)
+        submission.try_recover_from_json = Mock()
+        submission.update_submission_state = Mock()
+        submission.serialize = Mock(return_value={"preserved": True})
+        submission._diagnose = Mock(
+            return_value={
+                "category": "scientific_stop",
+                "reason": "SCF limit",
+                "scheduler": {},
+                "attempt": {},
+            }
+        )
+        result = submission.run_submission()
+        self.assertEqual(result, {"preserved": True})
+        self.assertEqual(
+            submission.recovery_ledger["tasks"][task.task_work_path]["status"],
+            "discarded",
+        )
+        job.submit_job.assert_not_called()
+
+    def test_enabling_monitor_preserves_existing_instrumented_campaign(self):
+        self.make_inputs("task.019.000000")
+        mdata = {
+            "fp_command": "vasp",
+            "fp_machine": self.real_machine(),
+            "fp_resources": self.real_resources(),
+        }
+        data = {"fp_style": "vasp", "fp_recovery": {"enabled": True}}
+        submissions = []
+
+        def simulate(submission, **kwargs):
+            submission.generate_jobs()
+            submission.try_recover_from_json()
+            if not submissions:
+                submission.upload_jobs()
+                submission.belonging_jobs[0].job_id = "9988"
+                submission.belonging_jobs[0].job_state = JobStatus.running
+                submission.submission_to_json()
+            submissions.append(submission)
+            submission._save()
+
+        with patch.object(
+            recovery.RecoverySubmission,
+            "run_submission",
+            autospec=True,
+            side_effect=simulate,
+        ):
+            recovery.run_recovery(
+                self.root,
+                data,
+                mdata,
+                ["POSCAR", "INCAR", "POTCAR", "KPOINTS"],
+                ["OUTCAR", "fp.log"],
+            )
+            recovery.run_recovery(
+                self.root,
+                dict(data, fp_monitor={"enabled": True}),
+                mdata,
+                ["POSCAR", "INCAR", "POTCAR", "KPOINTS"],
+                ["OUTCAR", "fp.log"],
+            )
+        self.assertEqual(submissions[0].submission_hash, submissions[1].submission_hash)
+        self.assertEqual(submissions[1].belonging_jobs[0].job_id, "9988")
+        self.assertTrue(submissions[1].fp_monitor_options["enabled"])

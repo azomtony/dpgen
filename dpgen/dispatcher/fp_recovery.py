@@ -21,6 +21,7 @@ from dpdispatcher.submission import JobStatus
 
 from dpgen import dlog
 from dpgen.dispatcher import fp_recovery_worker as worker
+from dpgen.dispatcher import fp_vasp_monitor as vasp_monitor
 
 _existing_request = ContextVar("fp_existing_directory", default=None)
 
@@ -106,6 +107,11 @@ def options(jdata):
 def validate_vasp(task):
     """Validate convergence and parseable, finite single-point labels."""
     task = Path(task)
+    if vasp_monitor.stopped_task(task):
+        return (
+            False,
+            "Single point was stopped by the FP monitor; outputs are not labels",
+        )
     try:
         content = (task / "OUTCAR").read_text(errors="replace")
         if "Elapsed time" not in content and "Elapse" not in content:
@@ -338,7 +344,7 @@ class RecoverySubmission(Submission):
                 and self.recovery_ledger["tasks"][
                     job.job_task_list[0].task_work_path
                 ].get("status")
-                not in ("successful", "failed")
+                not in ("successful", "failed", "discarded")
             ]
             if pending:
                 self._activity("staging inputs for unsubmitted tasks")
@@ -357,7 +363,7 @@ class RecoverySubmission(Submission):
                 self.submission_to_json()
                 self._save()
                 if all(
-                    entry.get("status") in ("successful", "failed")
+                    entry.get("status") in ("successful", "failed", "discarded")
                     for entry in self.recovery_ledger["tasks"].values()
                 ):
                     break
@@ -407,7 +413,7 @@ class RecoverySubmission(Submission):
         }
         self._save()
         dlog.info(
-            "%s progress: successful=%d/%d running=%d waiting=%d retry_wait=%d pending=%d failed=%d; next check in %s s",
+            "%s progress: successful=%d/%d running=%d waiting=%d retry_wait=%d pending=%d failed=%d discarded=%d discard_pending=%d; next check in %s s",
             self.recovery_label,
             counts.get("successful", 0),
             len(self.recovery_ledger["tasks"]),
@@ -416,6 +422,8 @@ class RecoverySubmission(Submission):
             counts.get("retry_wait", 0),
             counts.get("pending", 0) + counts.get("submitted", 0),
             counts.get("failed", 0),
+            counts.get("discarded", 0),
+            counts.get("discard_pending", 0),
             interval,
         )
 
@@ -442,6 +450,22 @@ class RecoverySubmission(Submission):
         self.belonging_tasks, self.belonging_jobs = job.job_task_list, [job]
         try:
             self.machine.context.download(self, check_exists=True, mark_failure=False)
+
+            if getattr(self, "fp_monitor_options", {}).get("enabled", False):
+                for filename in ("fp-monitor-stop.json", "OSZICAR"):
+                    for task in job.job_task_list:
+                        try:
+                            value = self.machine.context.read_file(
+                                str(Path(task.task_work_path) / filename)
+                            )
+                            target = self.recovery_root / task.task_work_path / filename
+                            target.write_text(
+                                value.decode(errors="replace")
+                                if isinstance(value, bytes)
+                                else value
+                            )
+                        except OSError:
+                            pass
         finally:
             self.belonging_tasks, self.belonging_jobs = tasks, jobs
 
@@ -479,7 +503,7 @@ class RecoverySubmission(Submission):
         for job in self.belonging_jobs:
             name = job.job_task_list[0].task_work_path
             entry = self.recovery_ledger["tasks"][name]
-            if entry.get("status") in ("successful", "failed"):
+            if entry.get("status") in ("successful", "failed", "discarded"):
                 continue
             marker = self._read_remote(f"{job.job_hash}_job_id").strip()
             if re.fullmatch(r"[0-9]+(?:_[0-9]+)?", marker) and (
@@ -509,7 +533,7 @@ class RecoverySubmission(Submission):
             task = job.job_task_list[0]
             name = task.task_work_path
             entry = self.recovery_ledger["tasks"][name]
-            if entry.get("status") == "successful":
+            if entry.get("status") in ("successful", "discarded", "discard_pending"):
                 continue
             self._download_job(job)
             self._activity("validating stage results", name)
@@ -552,10 +576,26 @@ class RecoverySubmission(Submission):
             backend = ""
         current_evidence = log if self.instrumented else log + "\n" + backend
         category, reason = worker.classify(current_evidence, scheduler.get("state", ""))
-        if attempt.get("category") in worker.UNLIMITED_RETRY_CATEGORIES:
+        if attempt.get("category") in worker.UNLIMITED_RETRY_CATEGORIES + (
+            "scientific_stop",
+        ):
             category, reason = attempt["category"], attempt["reason"]
+        if (
+            getattr(self, "fp_monitor_options", {}).get("enabled", False)
+            and category not in worker.UNLIMITED_RETRY_CATEGORIES
+        ):
+            try:
+                stop = json.loads(
+                    self._read_remote(Path(name) / "fp-monitor-stop.json") or "{}"
+                )
+                if stop.get("job_id") and str(stop["job_id"]) == str(job.job_id):
+                    category, reason = "scientific_stop", stop["reason"]
+            except (ValueError, KeyError):
+                pass
         validation_error = self.recovery_ledger["tasks"][name].get("validation_error")
-        if validation_error and category not in worker.UNLIMITED_RETRY_CATEGORIES:
+        if validation_error and category not in worker.UNLIMITED_RETRY_CATEGORIES + (
+            "scientific_stop",
+        ):
             category, reason = "application", validation_error
         return {
             "time": time.time(),
@@ -587,6 +627,18 @@ class RecoverySubmission(Submission):
             str(Path(name) / "fp_recovery_worker.py"),
             write_str=Path(worker.__file__).read_text(),
         )
+        if self.recovery_ledger.get("stage", "FP") == "FP":
+            policy["fp_monitor"] = getattr(
+                self, "fp_monitor_options", vasp_monitor.options()
+            )
+            self.machine.context.write_file(
+                str(Path(name) / "fp-recovery.json"), write_str=json.dumps(policy)
+            )
+            if policy["fp_monitor"]["enabled"]:
+                self.machine.context.write_file(
+                    str(Path(name) / "fp_vasp_monitor.py"),
+                    write_str=Path(vasp_monitor.__file__).read_text(),
+                )
 
     def _clear_finished_tags(self, job):
         names = [f"{job.job_hash}_job_tag_finished"]
@@ -617,12 +669,15 @@ class RecoverySubmission(Submission):
         self._save()
 
     def handle_unexpected_submission_state(self, *, continue_on_failure=False):
+        from dpgen.dispatcher.fp_discard import apply_requests
+
+        apply_requests(self)
         for job in self.belonging_jobs:
             task = job.job_task_list[0]
             name = task.task_work_path
             entry = self.recovery_ledger["tasks"][name]
             entry["job_id"] = str(job.job_id) if job.job_id else None
-            if entry.get("status") == "failed":
+            if entry.get("status") in ("failed", "discarded", "discard_pending"):
                 continue
             if entry.get("status") == "successful":
                 job.job_state = JobStatus.finished
@@ -657,6 +712,8 @@ class RecoverySubmission(Submission):
                     if category == "hardware"
                     else "gpu_initialization_failures"
                     if category == "gpu_initialization"
+                    else "scientific_stops"
+                    if category == "scientific_stop"
                     else "nonhardware_failures"
                 )
                 entry[counter] = entry.get(counter, 0) + 1
@@ -697,6 +754,8 @@ class RecoverySubmission(Submission):
                     diagnostic["reason"],
                     "unlimited " + category
                     if category in worker.UNLIMITED_RETRY_CATEGORIES
+                    else "no retry; exclude from labels"
+                    if category == "scientific_stop"
                     else "bounded nonhardware",
                 )
                 try:
@@ -704,6 +763,13 @@ class RecoverySubmission(Submission):
                 finally:
                     self.submission_to_json()
                     self._save()
+            if entry["diagnosis"]["category"] == "scientific_stop":
+                entry["status"] = "discarded"
+                job.job_state = FAILED
+                task.task_state = FAILED
+                job.failure_reason = entry["reason"]
+                self._save()
+                continue
             unlimited = (
                 entry["diagnosis"]["category"] in worker.UNLIMITED_RETRY_CATEGORIES
             )
@@ -871,7 +937,7 @@ def _check_conflicting_campaign(submission, ledger):
             str(entry["job_id"])
             for entry in ledger["tasks"].values()
             if entry.get("job_id")
-            and entry.get("status") not in ("successful", "failed")
+            and entry.get("status") not in ("successful", "failed", "discarded")
         }
     )
     if not ids:
@@ -897,6 +963,7 @@ def _run_recovery(
     from dpgen.dispatcher.Dispatcher import make_submission
 
     config = options(jdata)
+    monitor_config = vasp_monitor.options(jdata.get("fp_monitor"))
     if jdata["fp_style"] != "vasp" or mdata["fp_machine"].get("batch_type") != "Slurm":
         raise ValueError("FP recovery currently supports VASP single points with Slurm")
     work_base = os.fspath(root)
@@ -982,6 +1049,7 @@ def _run_recovery(
         )
         worker.atomic_json(manifest, ledger)
         selected.configure_recovery(root, config, ledger, instrumented=wrapped)
+        selected.fp_monitor_options = monitor_config
         dlog.info(
             "FP recovery: explicitly resuming %s; no replacement directory will be created",
             directory,
@@ -1038,7 +1106,10 @@ def _run_recovery(
                 if ledger["tasks"][name]["status"] == "successful"
                 else None
             )
+            policy["fp_monitor"] = monitor_config
             worker.atomic_json(existing, policy)
+            if monitor_config["enabled"]:
+                shutil.copyfile(vasp_monitor.__file__, task / "fp_vasp_monitor.py")
         builder.update(
             commands=["python fp_recovery_worker.py"],
             run_tasks=ledger["campaign_tasks"],
@@ -1056,6 +1127,11 @@ def _run_recovery(
             submission.submission_hash,
         )
     submission.configure_recovery(root, config, ledger, instrumented=instrumented)
+    submission.fp_monitor_options = monitor_config
+    if monitor_config["enabled"] and not instrumented:
+        dlog.warning(
+            "FP monitor: adopted uninstrumented jobs cannot be watched by the compute-node monitor; monitoring starts with new instrumented stages"
+        )
     # Parent recovery runs before any submission. It keeps the same hash and
     # remote root, continues siblings, and never cleans away partial results.
     submission.run_submission(

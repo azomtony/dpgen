@@ -1,0 +1,15 @@
+{
+  "fp_monitor": {
+    "enabled": true,
+    "max_scf_steps": 150,
+    "min_scf_steps": 60,
+    "stagnation_window": 20,
+    "min_relative_improvement": 0.05,
+    "unconverged_factor": 100,
+    "startup_timeout": 1800,
+    "stall_timeout": 1800,
+    "check_interval": 10,
+    "stop_grace_period": 120,
+    "kill_grace_period": 10
+  }
+}

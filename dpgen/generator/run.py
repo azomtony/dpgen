@@ -37,6 +37,7 @@ from packaging.version import Version
 from dpgen import ROOT_PATH, SHORT_CMD, dlog
 from dpgen.auto_test.lib.vasp import make_kspacing_kpoints
 from dpgen.dispatcher.Dispatcher import make_submission
+from dpgen.dispatcher.fp_vasp_monitor import stopped_task
 from dpgen.generator.lib.abacus_scf import (
     get_abacus_input_parameters,
     get_abacus_STRU,
@@ -4453,6 +4454,8 @@ def make_fp_calculation(iter_index, jdata, mdata):
 
 
 def _vasp_check_fin(ii):
+    if stopped_task(ii):
+        return False
     if os.path.isfile(os.path.join(ii, "OUTCAR")):
         with open(os.path.join(ii, "OUTCAR")) as fp:
             content = fp.read()
@@ -4602,6 +4605,7 @@ def run_fp_inner(
         jdata.get("fp_recovery", {}).get(
             "enabled", jdata.get("job_recovery", {}).get("enabled", False)
         )
+        or jdata.get("fp_monitor", {}).get("enabled", False)
         or requested_directory(work_path)
     ):
 
@@ -4857,6 +4861,10 @@ def post_fp_vasp(iter_index, jdata, rfailed=None):
         validation_sys = None
         all_te = []
         for oo in sys_outcars:
+            if stopped_task(os.path.dirname(oo)):
+                icount += 1
+                dlog.warning("FP monitor: excluded stopped single point %s", os.path.dirname(oo))
+                continue
             try:
                 _sys = dpdata.LabeledSystem(oo, type_map=jdata["type_map"])
             except Exception:

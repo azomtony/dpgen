@@ -504,3 +504,124 @@ provides UUID-based `CUDA_VISIBLE_DEVICES`, allowing identity capture even when
 CUDA cannot initialize. This is a cluster setting, not a `param.json` setting.
 Identification of the assigned physical GPU is separate from proving that the
 card is faulty; error 999 alone still does not trigger device blacklisting.
+
+## Stop unproductive VASP single points
+
+Add a top-level `fp_monitor` section to `param.json`. This example enables a
+150-iteration budget and an optional stagnation heuristic:
+
+```json
+"fp_monitor": {
+  "enabled": true,
+  "max_scf_steps": 150,
+  "min_scf_steps": 60,
+  "stagnation_window": 20,
+  "min_relative_improvement": 0.05,
+  "unconverged_factor": 100,
+  "startup_timeout": 1800,
+  "stall_timeout": 1800,
+  "check_interval": 10,
+  "stop_grace_period": 120,
+  "kill_grace_period": 10
+}
+```
+
+This is opt-in and supports Slurm VASP single-point tasks (`NSW <= 1`, positive
+`EDIFF`), using one FP task per job. Enabling it also activates the FP recovery
+controller if it was not enabled already. The monitor runs inside the allocated
+batch job and consumes the live VASP stdout that is recorded in `fp.log`, plus
+new OSZICAR records. It does not assume that nonconvergence proves bad geometry:
+SCF algorithm, mixing and smearing settings can also be responsible.
+
+The criteria are:
+
+- Nonfinite electronic energy changes or residuals request a stop immediately.
+- `max_scf_steps` limits electronic iterations without EDIFF convergence; the
+  INCAR `NELM` limit is also respected. Setting this option to zero removes the
+  additional budget but retains the NELM check. The default extra cap is 200.
+- `stagnation_window: 20` compares the best energy error in two successive
+  20-step windows, after at least `min_scf_steps`. The error is the larger of
+  absolute `dE` and `d eps`. A stop is requested only when the newer window fails
+  to improve by `min_relative_improvement` and its best error remains above
+  `unconverged_factor * EDIFF`. Improving or near-converged windows continue.
+  This is a configurable heuristic, not proof that a calculation could never
+  converge. The default `stagnation_window` is zero (heuristic disabled).
+- `startup_timeout` limits waiting for the first recognized electronic iteration.
+- `stall_timeout` limits inactivity in stdout, OSZICAR and OUTCAR after electronic
+  iterations begin. Growing OUTCAR/OSZICAR output counts as activity, even when
+  a slow electronic step has not finished. Zero disables either timeout.
+- Optional `max_runtime` sets an overall attempt time budget; its default is zero
+  (disabled). All time options are seconds.
+
+Stopping first writes [`LABORT = .TRUE.` to STOPCAR](https://vasp.at/wiki/STOPCAR),
+which requests termination at the next electronic step. If VASP does not exit
+within `stop_grace_period`, the worker signals only its own application process
+group with SIGTERM, then SIGKILL after `kill_grace_period`. It does not cancel
+other tasks or jobs. The usual Slurm cleanup still applies when a batch job ends.
+
+The reason and last SCF record are preserved in `fp-monitor-stop.json`,
+`fp-attempt.json`, the application log and recovery history. Recovery reports
+these tasks as `discarded` / `scientific_stop`, never resubmits them unchanged,
+and continues monitoring their siblings. Their partial outputs are excluded
+from both training and validation labeling, even when a parser could read an
+energy or force. The structures and diagnostic outputs remain available for
+review or separate recalculation with revised settings. Such stops count toward
+the existing `failed_ratio` / `ratio_failed` limit; the workflow can still stop
+at postprocessing if too few valid labels remain. This monitor does not relax
+that quality check or change INCAR settings.
+
+New submissions and subsequent instrumented retries receive the monitor.
+Already running scripts are unchanged, and adopted older uninstrumented
+submissions cannot acquire the compute-node watchdog retroactively. Updating a
+controller alone does not start monitoring an already running VASP process.
+Scientific commands, input fingerprints, job IDs and staging identities remain
+unchanged when this policy is enabled for an existing instrumented campaign.
+
+## Discard selected FP jobs that are already running
+
+Use `dpgen fp-discard` when inspection shows that particular FP inputs should
+not be run or retried unchanged. This works for recovery-managed running jobs,
+including older jobs that do not have the SCF watchdog. It is a separate manual
+decision from automatic SCF monitoring.
+
+First update the cluster installation and restart the DP-GEN recovery controller
+with the same workflow command. Stopping only that controller leaves its Slurm
+jobs intact. An older running controller does not know how to consume these new
+requests. From the affected iteration's `02.fp` directory, for example:
+
+```bash
+dpgen fp-discard . --jobs 43349984 --reason "SCF oscillating without convergence"
+```
+
+Or select the input task, including any current retry, rather than an old job ID:
+
+```bash
+dpgen fp-discard . --tasks task.021.000037 --reason "SCF oscillating without convergence"
+```
+
+Multiple job IDs or task names can be supplied. Add `--dry-run` to preview the
+resolved task list without writing requests or cancelling anything. Unknown IDs,
+tasks outside this stage, and already validated successful tasks are rejected.
+A supplied job ID resolves to a task in the local recovery manifest. If that
+same input is requeued before the controller reads the request, cancellation
+follows the task's current job ID; it does not target an unrelated allocation.
+Existing grouped jobs are rejected rather than cancelling unselected tasks.
+
+The CLI queues an atomic, locked `.fp-discard-requests.json` request in `02.fp`;
+it does not directly contact Slurm. The updated controller consumes it at its
+next check. If the controller is stopped, resume it to carry out cancellation.
+Before calling `scancel` through the configured machine, the controller persists
+`discard_pending` in its ledger and writes `fp-discard.json` in each selected
+task directory. This disables retries even if cancellation fails or the
+controller exits between operations. It then waits for scheduler confirmation
+before marking the task `discarded`. Pending requests and cancellation errors
+remain visible in the queue/ledger and controller logs.
+
+The request is scoped to the submission hash and scientific-input fingerprint.
+Changed identities cause an error without scheduler mutation. Restarting the
+controller resumes pending cancellations and does not automatically resubmit
+the selected tasks. The reason is recorded in recovery history. The scoped
+queue intent and discard marker exclude outputs from both training and holdout
+labels, including a task finishing between request and cancellation. Structures,
+logs and any partial results are retained. Other tasks continue normally.
+Discarded tasks still count toward the existing FP failure-ratio quality check.

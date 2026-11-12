@@ -1153,6 +1153,12 @@ def fp_args() -> list[Argument]:
             doc="Hardware-aware Slurm recovery for training and LAMMPS exploration; one task per job. Uses the same options as fp_recovery.",
         ),
         Argument(
+            "fp_monitor",
+            dict,
+            optional=True,
+            doc="Opt-in live SCF limits and stagnation watchdog for Slurm VASP single points. Monitor-stopped outputs are excluded from labeling; failed_ratio still applies.",
+        ),
+        Argument(
             "fp_recovery",
             dict,
             optional=True,
