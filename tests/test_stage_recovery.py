@@ -270,3 +270,87 @@ class TestStageRecovery(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "inputs differ"):
             self.make()
         self.assertFalse((self.root / ".fp-recovery.json").exists())
+
+    def saved_training(self):
+        self.resources["custom_flags"] = ["#SBATCH --time=08:00:00"]
+        first = self.make()
+        first.generate_jobs()
+        first.upload_jobs()
+        first.belonging_jobs[0].job_id = "45678"
+        first.belonging_jobs[0].job_state = JobStatus.running
+        first.submission_to_json()
+        first._save()
+        return first
+
+    def test_walltime_change_resumes_original_jobs_and_saved_resources(self):
+        first = self.saved_training()
+        checkpoint = Path(first.machine.context.remote_root) / "000/model.ckpt.pt"
+        checkpoint.write_bytes(b"preserved checkpoint")
+        self.resources["custom_flags"] = ["#SBATCH --time=24:00:00"]
+        with patch("dpgen.dispatcher.stage_recovery.dlog.warning") as warning:
+            resumed = self.make()
+        self.assertEqual(resumed.submission_hash, first.submission_hash)
+        self.assertEqual(
+            resumed.machine.context.remote_root, first.machine.context.remote_root
+        )
+        self.assertEqual(resumed.belonging_jobs[0].job_id, "45678")
+        self.assertEqual(resumed.resources.custom_flags, ["#SBATCH --time=08:00:00"])
+        self.assertEqual(checkpoint.read_bytes(), b"preserved checkpoint")
+        self.assertEqual(
+            resumed.recovery_ledger["resource_difference_fields"], ["custom_flags"]
+        )
+        warning.assert_called_once()
+        # The original signature stays authoritative across repeated resumes.
+        again = self.make()
+        self.assertEqual(again.submission_hash, first.submission_hash)
+        self.assertEqual(again.belonging_jobs[0].job_id, "45678")
+
+    def test_walltime_change_does_not_allow_scientific_command_change(self):
+        self.saved_training()
+        self.resources["custom_flags"] = ["#SBATCH --time=24:00:00"]
+        self.builder["commands"] = ["dp train different.json", "dp freeze"]
+        with self.assertRaisesRegex(RuntimeError, "scientific command"):
+            self.make()
+
+    def test_walltime_change_does_not_allow_training_input_change(self):
+        self.saved_training()
+        self.resources["custom_flags"] = ["#SBATCH --time=24:00:00"]
+        (self.task / "input.json").write_text('{"changed": true}')
+        with self.assertRaisesRegex(RuntimeError, "scientific inputs changed for 000"):
+            self.make()
+
+    def test_walltime_change_does_not_allow_machine_context_change(self):
+        self.saved_training()
+        self.resources["custom_flags"] = ["#SBATCH --time=24:00:00"]
+        self.machine["retry_count"] = 9
+        with self.assertRaisesRegex(RuntimeError, "machine settings changed"):
+            self.make()
+
+    def test_exploration_walltime_change_keeps_checkpoint_and_submission(self):
+        (self.task / "input.lammps").write_text("run 10000 upto\n")
+        builder = dict(
+            self.builder,
+            commands=["lmp -i input.lammps"],
+            forward_files=["input.lammps"],
+            backward_files=["model_devi.out"],
+        )
+        self.resources["custom_flags"] = ["#SBATCH --time=01:00:00"]
+        first = make_stage_submission(
+            self.data, "model_devi", self.machine, self.resources, **builder
+        )
+        first.generate_jobs()
+        first.upload_jobs()
+        first.belonging_jobs[0].job_id = "12321"
+        first.belonging_jobs[0].job_state = JobStatus.running
+        first.submission_to_json()
+        first._save()
+        checkpoint = Path(first.machine.context.remote_root) / "000/dpgen.restart.10000"
+        checkpoint.write_bytes(b"MD checkpoint")
+        self.resources["custom_flags"] = ["#SBATCH --time=02:00:00"]
+        resumed = make_stage_submission(
+            self.data, "model_devi", self.machine, self.resources, **builder
+        )
+        self.assertEqual(first.submission_hash, resumed.submission_hash)
+        self.assertEqual(resumed.belonging_jobs[0].job_id, "12321")
+        self.assertEqual(checkpoint.read_bytes(), b"MD checkpoint")
+        self.assertEqual(resumed.resources.custom_flags, ["#SBATCH --time=01:00:00"])

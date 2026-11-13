@@ -625,3 +625,23 @@ queue intent and discard marker exclude outputs from both training and holdout
 labels, including a task finishing between request and cancellation. Structures,
 logs and any partial results are retained. Other tasks continue normally.
 Discarded tasks still count toward the existing FP failure-ratio quality check.
+
+### Changing wall time while resuming training or exploration
+
+Changing `machine.json` resource fields, including `custom_flags` wall-time
+requests, does not require abandoning an existing recovery campaign. Recovery
+verifies the task input fingerprints, scientific commands, transfer lists,
+machine/context, and saved submission identity before restoring the original
+submission record. It then uses the **saved resources** for its existing jobs
+and retries. The controller reports the changed resource field names; the
+current `machine.json` resources apply when a new stage is created. This does
+not update the Slurm time limit of an already submitted job.
+
+This also supports older stage recovery manifests that stored only a signature:
+input fingerprints and the saved submission/worker policy are checked before
+resuming. The original signature, staging directory, job IDs, and checkpoints
+remain intact. Changed scientific inputs, commands, common-data/model file
+lists, or machine/context settings are still rejected with a specific message.
+If the original submission record cannot be found or verified, recovery fails
+rather than creating a replacement directory. Do not delete the recovery
+manifest or checkpoints to bypass the guard.

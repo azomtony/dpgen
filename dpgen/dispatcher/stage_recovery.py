@@ -3,13 +3,20 @@
 import fcntl
 import hashlib
 import json
+import os
+import re
 import shutil
 from pathlib import Path
 from shlex import quote
 
 from dpgen import dlog
 from dpgen.dispatcher import fp_recovery_worker as worker
-from dpgen.dispatcher.fp_recovery import RecoverySubmission, options
+from dpgen.dispatcher.fp_recovery import (
+    RecoverySubmission,
+    _resource_difference_fields,
+    _text,
+    options,
+)
 
 
 class StageSubmission(RecoverySubmission):
@@ -55,6 +62,134 @@ def validate_result(task, fingerprint, artifacts, plasma=False, require_receipt=
         return True, "Successful command chain and expected stage outputs"
     except (OSError, ValueError, TypeError) as exc:
         return False, f"Cannot validate stage output: {exc}"
+
+
+def resume_saved_resources(
+    root, ledger, stage, machine, resources, builder, fingerprints, input_files, command
+):
+    """Restore the saved identity after a resource-only change, without upload."""
+    from dpgen.dispatcher.Dispatcher import make_submission
+
+    previous = {
+        name: entry.get("input_digest") for name, entry in ledger["tasks"].items()
+    }
+    changed = sorted(
+        name
+        for name in set(previous) | set(fingerprints)
+        if previous.get(name) != fingerprints.get(name)
+    )
+    if changed:
+        raise RuntimeError(
+            "Stage scientific inputs changed for "
+            + ", ".join(changed)
+            + "; refusing to duplicate an existing recovery campaign"
+        )
+    identifier, directory = ledger.get("submission_hash", ""), ledger.get("remote_root")
+    if not re.fullmatch(r"[0-9a-f]{40}", identifier) or not directory:
+        raise RuntimeError(
+            "Stage settings changed but the saved submission location is unavailable; restore original resources before resuming"
+        )
+    effective_resources = (
+        dict(resources, group_size=1) if ledger.get("instrumented", True) else resources
+    )
+    probe = make_submission(
+        machine, effective_resources, submission_class=StageSubmission, **builder
+    )
+    if not isinstance(probe, StageSubmission):
+        raise ValueError("job_recovery requires batch Slurm execution without --gpus")
+    context = probe.machine.context
+    context.remote_root = directory
+    context.temp_remote_root = os.path.dirname(directory)
+    try:
+        record = json.loads(_text(context.read_file(identifier + ".json")))
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot read the saved stage submission; no replacement directory will be created"
+        ) from exc
+    machine_fields = _resource_difference_fields(
+        record.get("machine", {}), probe.machine.serialize()
+    )
+    if machine_fields:
+        raise RuntimeError(
+            "Stage machine settings changed: "
+            + ", ".join(machine_fields)
+            + "; restore the original machine/context before resuming"
+        )
+    restored = StageSubmission.deserialize(
+        record, machine=probe.machine, bind_context=False
+    )
+    if (
+        restored.submission_hash != identifier
+        or Path(context.temp_local_root, restored.work_base).resolve() != root
+    ):
+        raise RuntimeError(
+            "Saved submission identity or stage does not match; no replacement will be created"
+        )
+    if set(task.task_work_path for task in restored.belonging_tasks) != set(
+        fingerprints
+    ):
+        raise RuntimeError(
+            "Saved stage task list changed; refusing to duplicate an existing recovery campaign"
+        )
+    if any(len(job.job_task_list) != 1 for job in restored.belonging_jobs):
+        raise RuntimeError("Saved recovery submission must contain one task per job")
+    if sorted(restored.forward_common_files) != builder["forward_common_files"]:
+        raise RuntimeError(
+            "Stage common data/model file list changed; refusing to duplicate an existing recovery campaign"
+        )
+    for task in restored.belonging_tasks:
+        wrapped = ledger.get("instrumented", True)
+        expected_command = "python fp_recovery_worker.py" if wrapped else command
+        expected_forward = builder["forward_files"] + (
+            ["fp_recovery_worker.py", "fp-recovery.json"] if wrapped else []
+        )
+        expected_backward = builder["backward_files"] + (
+            ["fp-attempt.json", "fp-runtime.log"] if wrapped else []
+        )
+        if (
+            task.command != expected_command
+            or sorted(task.forward_files) != sorted(expected_forward)
+            or sorted(task.backward_files) != sorted(expected_backward)
+            or task.outlog != builder["outlog"]
+            or task.errlog != builder["errlog"]
+        ):
+            raise RuntimeError(
+                "Stage command or transferred file settings changed; refusing to duplicate an existing recovery campaign"
+            )
+        if wrapped:
+            policy = json.loads(
+                _text(
+                    context.read_file(
+                        str(Path(task.task_work_path) / "fp-recovery.json")
+                    )
+                )
+            )
+            if policy.get("command") != command or sorted(
+                policy.get("input_files", [])
+            ) != sorted(input_files):
+                raise RuntimeError(
+                    "Stage scientific command or input list changed; refusing to duplicate an existing recovery campaign"
+                )
+    restored.existing_remote_root = directory
+    restored.bind_machine(probe.machine)
+    fields = _resource_difference_fields(
+        restored.resources.serialize(), probe.resources.serialize()
+    )
+    ledger["resource_difference_fields"] = fields
+    if fields:
+        dlog.warning(
+            "%s recovery: machine.json resource fields differ: %s. Resuming existing submission %s with its saved resources, job IDs and staging directory; new settings apply to new stages.",
+            stage,
+            ", ".join(fields),
+            identifier,
+        )
+    else:
+        dlog.info(
+            "%s recovery: resuming verified existing submission %s with saved settings",
+            stage,
+            identifier,
+        )
+    return restored
 
 
 def make_stage_submission(
@@ -108,12 +243,20 @@ def make_stage_submission(
     ).hexdigest()
     manifest = root / ".fp-recovery.json"
     ledger = json.loads(manifest.read_text()) if manifest.exists() else None
-    if ledger is not None and ledger.get("signature") != signature:
-        raise RuntimeError(
-            "Stage inputs or resources changed; refusing to duplicate an existing recovery campaign"
-        )
     legacy = None
-    if ledger is None or not ledger.get("instrumented", True):
+    if ledger is not None and ledger.get("signature") != signature:
+        legacy = resume_saved_resources(
+            root,
+            ledger,
+            stage,
+            machine,
+            resources,
+            builder,
+            fingerprints,
+            input_files,
+            command,
+        )
+    if legacy is None and (ledger is None or not ledger.get("instrumented", True)):
         legacy_builder = dict(
             ledger.get("legacy_builder", original_builder)
             if ledger
