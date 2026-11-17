@@ -78,6 +78,9 @@ OUTPUT_FILES = (
     "fp-monitor-stop.json",
 )
 PROTECTED_OUTPUTS = ("OUTCAR", "vasprun.xml", "OSZICAR")
+# Not copied out of an old staging folder: not labels, often many GB, and the
+# originals remain there.
+HARVEST_SKIP = ("STOPCAR", "WAVECAR", "CHG", "CHGCAR", "vaspout.h5")
 TERMINAL = ("done", "stopped", "failed", "discarded")
 ACTIVE = ("queued", "running")
 JOB_ID = re.compile(r"[0-9]+(?:_[0-9]+)?")
@@ -852,13 +855,29 @@ class Campaign:
                         name, attempt, "result copied from previous staging"
                     )
                     continue
+                outputs = Path(self.view.get(name, self.root / name))
+                stop = _stop_reason(outputs)
+                if stop:
+                    attempt.update(category="scientific_stop", reason=stop)
+                    entry.update(status="stopped", reason=stop)
+                    self.event(
+                        name,
+                        f"stopped by the FP monitor under the previous controller "
+                        f"({stop}); excluded, not rerun. `dpgen fp release` reruns it.",
+                    )
+                    continue
+                previous = _previous_failure(outputs, old)
+                if previous:
+                    attempt.update(reason=previous)
+                    entry["reason"] = f"previous attempt: {previous}"
             if old.get("status") == "failed":
                 entry.update(
                     status="held",
                     reason="exhausted retries under the previous controller: "
                     + str(old.get("reason", "")),
                 )
-            self.event(name, f"adopted as {entry['status']}")
+            note = f" ({entry['reason']})" if entry.get("reason") else ""
+            self.event(name, f"adopted as {entry['status']}{note}")
 
     def _harvest_legacy(self, name, attempt):
         source = Path(attempt["legacy_dir"])
@@ -867,7 +886,9 @@ class Campaign:
             return  # outputs were written in place already
         if self.dry_run:
             present = [
-                f for f in OUTPUT_FILES if (source / f).is_file() and f != "STOPCAR"
+                f
+                for f in OUTPUT_FILES
+                if (source / f).is_file() and f not in HARVEST_SKIP
             ]
             self.view[name] = str(source)
             if present:
@@ -878,7 +899,7 @@ class Campaign:
         self._archive(name, label="local-before-adopt")
         copied = []
         for filename in OUTPUT_FILES:
-            if (source / filename).is_file() and filename not in ("STOPCAR",):
+            if (source / filename).is_file() and filename not in HARVEST_SKIP:
                 shutil.copy2(source / filename, task / filename)
                 copied.append(filename)
         attempt["harvested"] = copied
@@ -1068,7 +1089,7 @@ class Campaign:
         lines += [line.format_map(context) for line in self.config["prepend"]]
         lines += [
             f"cd {_shell_quote(str(task))}",
-            f"{_shell_quote(self.config['python'] or sys.executable)} fp_recovery_worker.py",
+            f"{_shell_quote(self.config['python'] or os.path.realpath(sys.executable))} fp_recovery_worker.py",
             "",
         ]
         return job_name, command, values, "\n".join(lines)
@@ -1546,6 +1567,37 @@ class Campaign:
                 + " ".join(f"{k}={v}" for k, v in sorted(counts.items())),
             )
             return counts
+
+
+def _stop_reason(directory):
+    """Reason recorded by the VASP monitor in ``directory``, if it stopped the run."""
+    directory = Path(directory)
+    try:
+        stop = json.loads((directory / "fp-monitor-stop.json").read_text())
+        return stop.get("reason") or "stopped by the FP monitor"
+    except (OSError, ValueError):
+        pass
+    try:
+        report = json.loads((directory / "fp-attempt.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if report.get("category") == "scientific_stop":
+        return report.get("reason") or "stopped by the FP monitor"
+    return None
+
+
+def _previous_failure(directory, old):
+    """Short description of why the previous controller's attempt failed."""
+    try:
+        report = json.loads((Path(directory) / "fp-attempt.json").read_text())
+    except (OSError, ValueError):
+        report = {}
+    diagnosis = old.get("diagnosis") or {}
+    category = report.get("category") or diagnosis.get("category")
+    reason = report.get("reason") or old.get("reason") or diagnosis.get("reason")
+    if category in (None, "success") and not reason:
+        return None
+    return ": ".join(str(x) for x in (category, reason) if x)[:200]
 
 
 def _rule_matches(rule, name, entry):

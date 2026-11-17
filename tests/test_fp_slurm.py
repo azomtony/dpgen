@@ -515,7 +515,9 @@ class TestFPSlurm(unittest.TestCase):
 
         self.start()
         script = (self.task(self.small) / "fp.sbatch").read_text()
-        self.assertIn(f"{sys.executable} fp_recovery_worker.py", script)
+        self.assertIn(
+            f"{os.path.realpath(sys.executable)} fp_recovery_worker.py", script
+        )
 
     # ---- dry run -------------------------------------------------------
 
@@ -663,6 +665,41 @@ class TestFPSlurm(unittest.TestCase):
         code = fp_slurm.workflow_dry_run("param.json", "machine.json", out=out)
         self.assertEqual(code, 1)
         self.assertIn("inside fp.resources", out.getvalue())
+
+    def test_adoption_keeps_previous_monitor_stops_and_skips_large_files(self):
+        staging = self.base / "staging" / ("a" * 40)
+        for name in (self.small, self.big):
+            (staging / name).mkdir(parents=True)
+            (staging / name / "OUTCAR").write_text("partial")
+            (staging / name / "WAVECAR").write_text("huge")
+        (staging / self.small / "fp-monitor-stop.json").write_text(
+            json.dumps({"job_id": "55", "reason": "SCF stagnation"})
+        )
+        (staging / self.big / "fp-attempt.json").write_text(
+            json.dumps(
+                {"job_id": "56", "category": "resource", "reason": "Out of memory"}
+            )
+        )
+        (self.root / ".fp-recovery.json").write_text(
+            json.dumps(
+                {
+                    "remote_root": str(staging),
+                    "tasks": {
+                        self.small: {"status": "retry_wait", "job_id": "55"},
+                        self.big: {"status": "retry_wait", "job_id": "56"},
+                    },
+                }
+            )
+        )
+        campaign = self.start()
+        small = self.entry(campaign, self.small)
+        self.assertEqual(small["status"], "stopped")
+        self.assertIn("SCF stagnation", small["reason"])
+        self.assertTrue(stopped_task(self.task(self.small)))
+        self.assertEqual([w for _, w in self.slurm.history], [str(self.task(self.big))])
+        self.assertIn("Out of memory", (self.root / "fp-events.log").read_text())
+        self.assertFalse((self.task(self.big) / "WAVECAR").exists())
+        self.assertTrue((staging / self.big / "WAVECAR").exists())
 
     def test_config_validation(self):
         with self.assertRaisesRegex(ValueError, "undefined variable"):
