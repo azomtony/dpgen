@@ -1,0 +1,42 @@
+{
+  "fp": {
+    "command": "mpirun -np 1 vasp_std",
+    "machine": {
+      "batch_type": "Slurm",
+      "context_type": "LazyLocalContext",
+      "local_root": "./"
+    },
+    "resources": {
+      "group_size": 1
+    },
+    "slurm": {
+      "enabled": true,
+      "check_interval": 30,
+      "job_name": "{iter}-{task}-{formula}-{natoms}at",
+      "vars": {
+        "ngpus": 1,
+        "time": "24:00:00",
+        "partition": "gpu"
+      },
+      "directives": [
+        "--partition={partition}",
+        "--nodes=1",
+        "--ntasks-per-node={ngpus}",
+        "--gres=gpu:{ngpus}",
+        "--time={time}"
+      ],
+      "prepend": [
+        "module load vasp/6.4.3-gpu"
+      ],
+      "command": "mpirun -np {ngpus} vasp_std",
+      "rules": [
+        {"min_natoms": 400, "vars": {"ngpus": 2}}
+      ],
+      "escalate": {
+        "resource": {"ngpus": [2, 4]},
+        "timeout": {"time": ["48:00:00"]}
+      },
+      "on_exhausted": "hold"
+    }
+  }
+}

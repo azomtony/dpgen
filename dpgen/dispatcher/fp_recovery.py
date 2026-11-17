@@ -32,6 +32,12 @@ def add_recovery_args(parser):
         metavar="PATH",
         help="Resume FP jobs from this existing staging directory (or submission JSON); never create a replacement directory.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check machine.json and show what the FP stage would adopt, update, "
+        "cancel and submit, with sample job scripts. Nothing is run or changed.",
+    )
 
 
 @contextmanager
@@ -112,6 +118,12 @@ def validate_vasp(task):
             False,
             "Single point was stopped by the FP monitor; outputs are not labels",
         )
+    return validate_vasp_outputs(task)
+
+
+def validate_vasp_outputs(task):
+    """Check VASP outputs against POSCAR, ignoring workflow stop/discard markers."""
+    task = Path(task)
     try:
         content = (task / "OUTCAR").read_text(errors="replace")
         if "Elapsed time" not in content and "Elapse" not in content:

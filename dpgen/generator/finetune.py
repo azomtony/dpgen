@@ -740,6 +740,12 @@ def run_finetune_iter(param_file, machine_file, force_train=False):
 
 def gen_finetune(args):
     """CLI entry point for ``dpgen finetune``."""
+    if getattr(args, "dry_run", False):
+        import sys
+
+        from dpgen.dispatcher.fp_slurm import workflow_dry_run
+
+        sys.exit(workflow_dry_run(args.PARAM, args.MACHINE))
     if args.PARAM and args.MACHINE:
         if args.debug:
             dlog.setLevel(logging.DEBUG)

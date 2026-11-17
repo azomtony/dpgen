@@ -645,3 +645,126 @@ lists, or machine/context settings are still rejected with a specific message.
 If the original submission record cannot be found or verified, recovery fails
 rather than creating a replacement directory. Do not delete the recovery
 manifest or checkpoints to bypass the guard.
+
+## In-place Slurm FP controller (recommended on a cluster login node)
+
+When dpgen runs on a login node that shares its filesystem with the compute
+nodes, enable `fp.slurm` in `machine.json` (full example:
+`machine-fp-slurm.json`). It replaces the dispatcher-based FP submission for
+VASP. Every job runs directly in its own `iter.XXXXXX/02.fp/task.SSS.FFFFFF`;
+there are no hash-named staging directories. Training and exploration are
+unchanged.
+
+```json
+"slurm": {
+  "enabled": true,
+  "vars": {"ngpus": 1, "time": "24:00:00", "partition": "gpu"},
+  "directives": ["--partition={partition}", "--nodes=1",
+                 "--ntasks-per-node={ngpus}", "--gres=gpu:{ngpus}", "--time={time}"],
+  "prepend": ["module load vasp/6.4.3-gpu"],
+  "command": "mpirun -np {ngpus} vasp_std",
+  "rules": [{"min_natoms": 400, "vars": {"ngpus": 2}}],
+  "escalate": {"resource": {"ngpus": [2, 4]}, "timeout": {"time": ["48:00:00"]}}
+}
+```
+
+**What you can see.** Each task holds a readable `fp.sbatch`,
+`slurm-<jobid>.out`, and `attempts/NNN/` with the outputs and script of every
+earlier attempt. Slurm job names identify the system, for example
+`i003-000.000012-Cu54O10-64at`, so `squeue --me` is readable. The stage holds:
+
+- `fp-status.tsv` — one row per task: atoms, formula, status, attempt, job, resources, reason
+- `fp-events.log` — every submission, failure, escalation and user action
+- `fp-campaign.json` — the controller's state
+
+**Resources per task.** Each submission takes the base `vars`, then matching
+`rules` (`min_natoms`, `max_natoms`, `systems`, `tasks` globs), then your
+overrides, then escalation. `escalate` maps a failure category to a ladder.
+`resource` (GPU or host out of memory, Slurm `OUT_OF_MEMORY`) moves `ngpus`
+1 → 2 → 4. `timeout` raises `time`. When the ladder ends, the task is
+**held** for you, not abandoned. Only the scientific inputs (POSCAR, INCAR,
+POTCAR, KPOINTS) identify a task, so you can change machine.json resources
+and restart dpgen at any time.
+
+**Jobs still waiting in the queue follow your changes.** With
+`"update_pending": true` (the default), each check compares every *pending*
+job with the resources its task resolves to now. If you add a rule (for
+example `min_natoms: 400 → ngpus: 2`) or run `dpgen fp set`, a waiting job that
+asked for less is cancelled with `scancel --state=PENDING` and submitted again
+before it ever starts. Slurm ignores that cancel for a job that has already
+started, so running work is never killed. Such a job keeps its original
+resources, and if it then runs out of memory, the next attempt uses the new
+values. Jobs adopted from the previous controller have no recorded request.
+They are replaced only when a rule or override targets their task. Replacing a
+pending job costs its place in the queue but no compute. Set
+`"update_pending": false` to leave queued jobs alone.
+
+**Preview before you run.** Add `--dry-run` to your usual command:
+
+```bash
+dpgen finetune param.json machine.json --dry-run     # or: dpgen run ... --dry-run
+```
+
+It checks `fp.slurm` in machine.json and reads `record.dpgen` to find the next
+step. If that step is FP, it shows exactly what the controller would do
+there: jobs adopted from the previous controller, results copied from old hash
+staging folders, pending jobs replaced (old → new resources), jobs submitted,
+and the `fp.sbatch` for each distinct resource set. It also shows whether the
+safety check would stop the run, and why. It submits, cancels, moves and
+writes nothing (dpdispatcher still notes its log location in
+`dpdispatcher.log`, as every dpgen command does). Run it on the login node: it
+reads the live queue. For a stage other than the next one, use
+`dpgen fp plan iter.000003 --param param.json --machine machine.json`. Any
+`dpgen fp set|hold|...` command also accepts `--dry-run`. For `set` it shows
+each task's resources before → after and what happens to its job.
+
+**Steering while it runs.** A running controller applies these within seconds.
+If it is stopped, they apply when dpgen resumes.
+
+```bash
+dpgen fp status                                   # latest stage; or: dpgen fp status iter.000003
+dpgen fp status --status held failed
+dpgen fp set --min-natoms 400 --status queued running held --var ngpus=2 --resubmit
+dpgen fp set --tasks task.000.000012 --var time=48:00:00     # next attempt only
+dpgen fp resubmit --jobs 123456
+dpgen fp hold --tasks 'task.002.*' --cancel
+dpgen fp release --status held
+dpgen fp discard --tasks task.001.000007 --reason "pathological geometry"
+```
+
+Every selecting command accepts `--dry-run`. `--resubmit` cancels an active
+job and submits again with the new resources. If that job finished
+successfully just before the cancellation, its result is kept.
+
+**Retries.** `retry` sets the number of retries per category; `-1` means
+unlimited. The defaults are: hardware, GPU initialization and preemption are
+unlimited; `unknown` gets 1; timeout, out of memory, SCF non-convergence,
+configuration errors and rejected `sbatch` get 0. Repeating a deterministic
+failure only wastes allocation. A task that runs out of retries is `held`
+(`"on_exhausted": "fail"` instead excludes it and lets `ratio_failed` decide).
+A job you `scancel` yourself is also held. Monitor-stopped single points
+(`fp_monitor`) are `stopped` and excluded.
+
+**Completed data is never lost.**
+
+- A task whose outputs validate is `done`. Its `OUTCAR`, `vasprun.xml` and
+  `OSZICAR` become read-only, and `fp-done.json` records their SHA-256. It is
+  never resubmitted.
+- On restart, a missing or modified validated output, or changed inputs of a
+  done task, stop the controller with an error. It does not silently relabel.
+- Before every retry, the previous outputs move to `attempts/NNN/`. Nothing
+  is deleted.
+- Before submitting, valid outputs already present are accepted, and a job
+  already queued in that directory is adopted.
+- An `sbatch` that times out is resolved by looking the job up by working
+  directory in `squeue`/`sacct`. It is never blindly resubmitted.
+- The controller refuses to start if untracked jobs are active in the stage.
+- `post_fp` labels only `done` tasks.
+
+**Adopting stages from the previous recovery controller.** If a stage has
+`.fp-recovery.json` but no `fp-campaign.json`, enabling `fp.slurm` imports it.
+Validated results are kept. Running jobs keep their IDs and are tracked to
+completion. Results in the old hash staging directory are *copied* into the
+task (the staging directory is left untouched). Tasks that exhausted retries
+under the old controller are held. Only unfinished tasks get new jobs, in the
+new layout.

@@ -56,6 +56,14 @@ def options(value=None):
 def stopped_task(task):
     """Never label a monitor-stopped task, even after partial output transfer."""
     task = Path(task)
+    try:
+        state = json.loads((task.parent / "fp-campaign.json").read_text())
+        entry = state.get("tasks", {}).get(task.name)
+        if entry is not None:
+            # In-place Slurm campaign: only validated results become labels.
+            return entry.get("status") != "done"
+    except (OSError, ValueError):
+        pass
     if (task / "fp-monitor-stop.json").exists() or (task / "fp-discard.json").exists():
         return True
     try:

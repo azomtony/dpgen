@@ -35,6 +35,11 @@ def read_requests(root):
 
 def request_discard(root, jobs=(), tasks=(), reason="", dry_run=False):
     root = Path(root).resolve()
+    if (root / "fp-campaign.json").is_file():
+        raise ValueError(
+            "This FP stage is managed by the in-place Slurm controller; use "
+            f"`dpgen fp discard {root} --tasks ... --reason ...` instead"
+        )
     if root.name != "02.fp" or not (root / ".fp-recovery.json").is_file():
         raise ValueError(
             "Select an existing 02.fp directory with a .fp-recovery.json record"

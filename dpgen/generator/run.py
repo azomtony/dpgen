@@ -4563,6 +4563,14 @@ def run_fp_inner(
         return
 
     fp_style = jdata["fp_style"]
+    from dpgen.dispatcher.fp_slurm import campaign_requested, run_campaign
+
+    if campaign_requested(work_path, mdata):
+        # In-place Slurm controller: readable task directories, per-task
+        # resources, and completed results that are never resubmitted.
+        run_campaign(work_path, jdata, mdata)
+        return
+
     if fp_style == "amber/diff":
         # firstly get sys_idx
         fp_command = (
@@ -6151,6 +6159,12 @@ def update_mass_map(jdata):
 
 
 def gen_run(args):
+    if getattr(args, "dry_run", False):
+        import sys
+
+        from dpgen.dispatcher.fp_slurm import workflow_dry_run
+
+        sys.exit(workflow_dry_run(args.PARAM, args.MACHINE))
     if args.PARAM and args.MACHINE:
         if args.debug:
             dlog.setLevel(logging.DEBUG)
