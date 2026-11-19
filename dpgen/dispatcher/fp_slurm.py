@@ -704,7 +704,11 @@ class Campaign:
 
     def _tracks_jobs(self):
         tasks = self.state["tasks"].values()
-        allocations = self.state.get("allocations", {}).values()
+        allocations = [
+            alloc
+            for _, pool in fp_pack.stage_pools(self.root)
+            for alloc in pool["allocations"].values()
+        ]
         return any(e["status"] in ACTIVE or e.get("submitting") for e in tasks) or any(
             a.get("status") in ("submitting", "queued", "running") for a in allocations
         )
@@ -763,9 +767,16 @@ class Campaign:
                 reason=f"moved from {before}; job there no longer tracked",
             )
             resubmit.append(name)
-        for alloc in self.state.get("allocations", {}).values():
-            if alloc.get("status") in ("submitting", "queued", "running"):
-                alloc.update(status="ended", ended=now, reason=f"moved from {before}")
+        for pool_dir, pool in fp_pack.stage_pools(self.root):
+            changed = False
+            for alloc in pool["allocations"].values():
+                if alloc.get("status") in ("submitting", "queued", "running"):
+                    alloc.update(
+                        status="ended", ended=now, reason=f"moved from {before}"
+                    )
+                    changed = True
+            if changed and not self.dry_run:
+                worker.atomic_json(pool_dir / fp_pack.node_pool.STATE, pool)
         jobs_left = len(resubmit)
         self.event(
             None,
@@ -793,7 +804,8 @@ class Campaign:
         }
         tracked |= {
             str(alloc.get("job_id"))
-            for alloc in (self.state or {}).get("allocations", {}).values()
+            for _, pool in fp_pack.stage_pools(self.root)
+            for alloc in pool["allocations"].values()
         }
         stray = sorted(
             job_id
@@ -1678,10 +1690,12 @@ class Campaign:
         else:
             if any(
                 a["status"] in ("submitting", "queued", "running")
-                for a in self.state.get("allocations", {}).values()
+                for _, pool in fp_pack.stage_pools(self.root)
+                for a in pool["allocations"].values()
             ):
                 # Pack mode was switched off: finish tracking what runs there.
                 self._pack().update(queue)
+                self._pack().pool.save()
             for name, entry in tasks.items():
                 if entry["status"] == "pending" and not entry.get("submitting"):
                     if entry.get("hold"):
@@ -1689,6 +1703,85 @@ class Campaign:
                         continue
                     if self.clock() >= entry.get("retry_after", 0):
                         self.submit(name, queue)
+        self.save()
+
+    # ---- dpgen-live.log / dpgen-summary.log -------------------------------
+
+    def report(self):
+        """One live line per check; a summary line at 25/50/75 % and at the end."""
+        if self.dry_run:
+            return
+        from dpgen import progress
+
+        workdir = self.root.parent.parent
+        tasks = self.state["tasks"]
+        counts = self.summary()
+        total = len(tasks)
+        finished = sum(counts.get(s, 0) for s in TERMINAL)
+        order = (
+            "done",
+            "running",
+            "queued",
+            "pending",
+            "held",
+            "failed",
+            "stopped",
+            "discarded",
+        )
+        text = " ".join(f"{k} {counts[k]}" for k in order if counts.get(k))
+        nodes = ""
+        if self.config["pack"]["enabled"] or self.pack is not None:
+            nodes = " | " + self._pack().pool.live_text()
+        progress.live(
+            workdir,
+            f"FP {self.iter_label} | {finished}/{total} finished: {text}{nodes}",
+        )
+        marks = self.state.setdefault("milestones", [])
+        for mark in (25, 50, 75):
+            if (
+                total
+                and finished * 100 >= mark * total
+                and mark not in marks
+                and finished < total
+            ):
+                marks.append(mark)
+                progress.summary(
+                    workdir,
+                    "fp_progress",
+                    f"{progress.iter_label(int(self.iter_label[1:]))}  FP {mark}%: {finished}/{total} finished ({text})",
+                    now=self.clock(),
+                    iteration=self.iter_label,
+                    percent=mark,
+                    **counts,
+                )
+        if self.complete() and "complete" not in marks:
+            marks.append("complete")
+            reasons = {}
+            for name, entry in tasks.items():
+                if entry["status"] in ("failed", "stopped", "discarded"):
+                    attempt = entry["attempts"][-1] if entry["attempts"] else {}
+                    why = attempt.get("category") or entry["status"]
+                    reasons[f"{entry['status']}: {why}"] = (
+                        reasons.get(f"{entry['status']}: {why}", 0) + 1
+                    )
+            elapsed = self.clock() - self.state.get("created", self.clock())
+            lines = [
+                f"{progress.iter_label(int(self.iter_label[1:]))}  FP complete: "
+                f"{counts.get('done', 0)} of {total} done in {progress.duration(elapsed)}"
+            ]
+            lines += [
+                f"  {count} {reason}" for reason, count in sorted(reasons.items())
+            ]
+            progress.summary(
+                workdir,
+                "fp_complete",
+                lines,
+                now=self.clock(),
+                iteration=self.iter_label,
+                seconds=round(elapsed),
+                reasons=reasons,
+                **counts,
+            )
         self.save()
 
     def _pack(self):
@@ -1732,6 +1825,7 @@ class Campaign:
             last = None
             while True:
                 self.step()
+                self.report()
                 if self.complete():
                     break
                 counts = self.summary()
@@ -1837,10 +1931,27 @@ def status_rows(state, config=None):
     return rows
 
 
+def attach_pool(config, stage_root, mdata, write):
+    """With pack.shared, use machine.json ``pool`` (the run-wide node pool)."""
+    if not config["pack"].get("shared"):
+        return config
+    if mdata.get("pool") is None:
+        raise ValueError(
+            'fp.slurm.pack.shared needs a top-level "pool" section in machine.json'
+        )
+    workdir = Path(stage_root).resolve().parent.parent
+    config["pool"] = (
+        fp_pack.node_pool.configure(workdir, mdata)
+        if write
+        else fp_pack.node_pool.pool_options(mdata["pool"])
+    )
+    return config
+
+
 def run_campaign(work_path, jdata, mdata, slurm=None, moved=False):
     if jdata.get("fp_style") != "vasp":
         raise ValueError("fp.slurm currently supports fp_style='vasp' only")
-    config = options(mdata.get("fp_slurm"))
+    config = attach_pool(options(mdata.get("fp_slurm")), work_path, mdata, write=True)
     if not config["enabled"]:
         raise RuntimeError("fp.slurm must be enabled to resume this FP campaign")
     counts = Campaign(work_path, config, jdata, slurm=slurm, moved=moved).run()
@@ -1872,7 +1983,11 @@ def plan_stage(
 
     Returns 0 when the stage would proceed and 1 when it would stop.
     """
-    config = options(mdata.get("fp_slurm"))
+    try:
+        config = attach_pool(options(mdata.get("fp_slurm")), root, mdata, write=False)
+    except ValueError as exc:
+        print(f"ERROR in machine.json: {exc}", file=out)
+        return 1
     campaign = Campaign(
         root,
         config,
@@ -1953,13 +2068,15 @@ def plan_stage(
 
     pack = campaign.config["pack"]
     if pack["enabled"]:
+        limits = campaign._pack().limits
         print(
-            f"\nAllocations: up to {pack['max_allocations']} × {pack['gpus']} GPU for "
-            f"{pack['time']}; tasks are assigned only to allocations that have started.",
+            f"\nAllocations{' (run-wide pool, shared with training/exploration)' if pack['shared'] else ''}: "
+            f"up to {campaign._pack().pool.limit('fp')} × {limits['gpus']} GPU for "
+            f"{limits['time']}; tasks are assigned only to allocations that have started.",
             file=out,
         )
-        allocs = campaign.state.get("allocations", {})
-        rows = fp_pack.summary_rows(campaign.state)
+        allocs = campaign._pack().allocs
+        rows = fp_pack.summary_rows(allocs)
         if rows:
             for row in rows:
                 print(
@@ -2297,7 +2414,11 @@ def command(args):
             + ": "
             + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
         )
-        allocations = fp_pack.summary_rows(state)
+        allocations = [
+            row
+            for _, pool in fp_pack.stage_pools(root)
+            for row in fp_pack.summary_rows(pool["allocations"])
+        ]
         if allocations:
             print(
                 "\nALLOCATION  JOB_ID      STATUS     NODE        GPUS        LEFT     TASKS"

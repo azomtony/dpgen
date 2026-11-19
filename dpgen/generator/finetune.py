@@ -665,6 +665,10 @@ def run_finetune_iter(param_file, machine_file, force_train=False):
             listener.start()
 
     mdata = convert_mdata(mdata)
+    from dpgen import progress
+    from dpgen.dispatcher.node_pool import configure as configure_pool
+
+    configure_pool(os.getcwd(), mdata)  # machine.json "pool" for batch_type Pilot
     finetune_model_source = jdata["finetune_model_source"]
     max_tasks = 10000
     numb_task = 9
@@ -693,6 +697,7 @@ def run_finetune_iter(param_file, machine_file, force_train=False):
                 continue
             task_name = "task %02d" % jj  # noqa: UP031
             sepline(f"{iter_name} {task_name}", "-")
+            step_started = progress.clock()
             if jj == 0:
                 log_iter("make_train", ii, jj)
                 _make_train_finetune(
@@ -736,6 +741,7 @@ def run_finetune_iter(param_file, machine_file, force_train=False):
             else:
                 raise RuntimeError("unknown task %d, something wrong" % jj)  # noqa: UP031
             record_iter(record, ii, jj)
+            progress.step_done(os.getcwd(), ii, jj, progress.clock() - step_started)
 
 
 def gen_finetune(args):

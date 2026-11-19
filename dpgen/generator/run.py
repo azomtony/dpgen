@@ -3178,6 +3178,9 @@ def _make_fp_vasp_inner(
         dlog.info(
             f"system {ss:s} accurate_ratio: {accurate_ratio:8.4f}    thresholds: {fp_accurate_soft_threshold:6.4f} and {fp_accurate_threshold:6.4f}   eff. task min and max {fp_task_min_sys:4d} {this_fp_task_max:4d}   number of fp tasks: {numb_task:6d}"
         )
+        from dpgen import progress
+
+        progress.note_selection(iter_index, ss, counter, numb_task)
         # make fp tasks
 
         # read all.lammpstrj, save in all_sys for each system_index
@@ -4937,6 +4940,9 @@ def post_fp_vasp(iter_index, jdata, rfailed=None):
             all_sys.to_deepmd_raw(sys_data_path)
             all_sys.to_deepmd_npy(sys_data_path, set_size=len(sys_outcars))
 
+    from dpgen import progress
+
+    progress.note_labels(iter_index, tcount, icount)
     if tcount == 0:
         rfail = 0.0
         dlog.info("failed frame: %6d in %6d " % (icount, tcount))  # noqa: UP031
@@ -5464,6 +5470,10 @@ def run_iter(param_file, machine_file):
             listener.start()
     # Convert mdata
     mdata = convert_mdata(mdata)
+    from dpgen import progress
+    from dpgen.dispatcher.node_pool import configure as configure_pool
+
+    configure_pool(os.getcwd(), mdata)  # machine.json "pool" for batch_type Pilot
     max_tasks = 10000
     numb_task = 9
     record = "record.dpgen"
@@ -5489,6 +5499,7 @@ def run_iter(param_file, machine_file):
                 continue
             task_name = "task %02d" % jj  # noqa: UP031
             sepline(f"{iter_name} {task_name}", "-")
+            step_started = progress.clock()
             if jj == 0:
                 log_iter("make_train", ii, jj)
                 make_train(ii, jdata, mdata)
@@ -5522,6 +5533,7 @@ def run_iter(param_file, machine_file):
             else:
                 raise RuntimeError("unknown task %d, something wrong" % jj)  # noqa: UP031
             record_iter(record, ii, jj)
+            progress.step_done(os.getcwd(), ii, jj, progress.clock() - step_started)
 
 
 def get_atomic_masses(atom):

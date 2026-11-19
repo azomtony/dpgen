@@ -822,3 +822,89 @@ How it works:
 `--dry-run` shows the allocation script and each waiting task's estimate.
 Turning `pack` off later is safe: tasks already in allocations are tracked to
 the end, and new work goes back to one job per task.
+
+## One node pool for training, exploration and FP (`pool`, `batch_type: Pilot`)
+
+On a cluster where short jobs wait a long time, keep a few long allocations
+(for example one 4-GPU node for 24 h) and run every stage on them, one job per
+GPU. Within an iteration the stages follow each other (training → exploration
+→ single points), so the same node runs 4 training models side by side, then 4
+exploration jobs at a time, then 4 single points at a time, and stays yours
+between stages. Start from `machine-pool.json`:
+
+- a top-level `pool` section describes the allocations: `gpus`, `time`,
+  `directives` (sbatch options, with `{gpus}`, `{time}`, `{allocation}` and your
+  `vars`), `prepend` (environment common to all jobs) and `max_allocations`,
+  either one number or per stage (`{"train": 1, "model_devi": 1, "fp": 2}`).
+- `train` and `model_devi` use `"batch_type": "Pilot"` with `LazyLocalContext`.
+  Each dispatcher job runs in its usual folder on `gpu_per_node` GPU(s); load the
+  DeePMD/LAMMPS environment with `source_list` or `module_list` in `resources`.
+  Do not set `strategy.if_cuda_multi_devices`: the pool assigns GPUs.
+- `fp.slurm.pack` gets `"shared": true`, so single points use the same pool
+  instead of allocations of their own. Their environment comes from
+  `fp.slurm.prepend` (written to each task's `fp-pilot.sh`).
+
+How it behaves:
+
+- Work goes only to allocations that have started; jobs that need more GPUs
+  go first, then the oldest.
+- Runtime estimates: FP uses the per-size model above. Training and exploration
+  use the median of earlier jobs of the same stage times `safety_factor`, or
+  `pool.runtime` until there is history. A job starts only if its estimate plus
+  `start_margin` fits the time left. When the running node is too close to its
+  end for the waiting work, its successor is requested right away.
+- A failed training/exploration job is resubmitted by dpdispatcher as usual. A
+  job whose allocation ends before it starts simply waits for the next one.
+- More nodes for FP, one for training/exploration: with
+  `"max_allocations": {"train": 1, "model_devi": 1, "fp": 2}` single points can
+  use two nodes. When nothing is waiting, the `keep` node(s) (default 1) with
+  the most time left stay for the next stage; any other node is asked to exit
+  once its last job ends, and a node still in the queue is cancelled.
+  Training and exploration go to the node with the most time left.
+- The kept node waits through the short steps between stages and exits only
+  after `idle_exit` (default 30 min) with nothing to do. Raise it if
+  `post_fp`/`make_train` take longer than that on your data.
+- `renew_before` (e.g. `"06:00:00"`): while work is running or waiting and the
+  only node left has less than this much time, its successor is requested, so
+  the workflow does not fall back into the queue when that node ends. Set it to
+  about how long a node takes to start on your cluster.
+- `dpgen pool --drain` asks every node to exit once its jobs finish.
+- `dpgen pool` shows the allocations (node, busy GPUs, time left) and the
+  waiting and running jobs of every stage; `dpgen fp status` also lists them.
+
+Files: `allocations/pool.json` (state), `allocations/pool-config.json` (copied
+from machine.json each time dpgen starts), `allocations/pool-events.log`, and
+`allocations/A01/` (sbatch script, pilot log, inbox/running/finished).
+
+## Move an FP stage to another cluster (`dpgen fp run --moved`)
+
+To finish one iteration's single points elsewhere:
+
+1. Stop dpgen on the old cluster and cancel the stage's pending jobs.
+2. Copy `iter.XXXXXX/02.fp` (keep the folder names; large files such as
+   `WAVECAR`/`CHG*` are not needed).
+3. On the new cluster, with a machine.json for that cluster:
+   `dpgen fp run iter.XXXXXX --param param.json --machine machine.json --moved --dry-run`,
+   then the same without `--dry-run`.
+
+`--moved` is needed once. Tasks whose jobs finished before the copy are
+validated and marked done, the old cluster's job IDs are forgotten, and every
+unfinished task runs again here (partial outputs are archived; no retry is
+used). Without `--moved`, dpgen refuses to start when the stage was last run on
+another cluster and still lists active jobs. When the stage is complete, copy
+`02.fp` back and resume the workflow as usual.
+
+## Logs: live, summary, everything
+
+Three files in the run directory, no settings needed:
+
+- `dpgen-live.log`: one line per check while jobs run (FP every
+  `fp.slurm.check_interval`, training/exploration every ~10–30 s), e.g.
+  `FP i009 | 35/70 finished: done 33 running 8 failed 2 | nodes A01 4/4 GPU 18.2 h left, A02 4/4 GPU 21.0 h left`.
+  Follow it with `tail -f dpgen-live.log`. Rotated at 20 MB.
+- `dpgen-summary.log`: milestones only. Each step with its duration, the
+  exploration table per system (accurate / candidate / failed, FP tasks chosen),
+  FP at 25/50/75 % and complete (with failures by reason), labels added in
+  `post_fp`, and nodes started (with their queue wait) or ended.
+  `dpgen-summary.jsonl` has the same records as JSON lines for plots.
+- `dpgen.log`: everything, as before.

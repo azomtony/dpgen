@@ -14,18 +14,19 @@ failed attempts are archived, and a task is never assigned twice.
 
 import json
 import math
-import os
 import re
 import shutil
 import statistics
 import time
 from pathlib import Path
 
-from dpgen.dispatcher import fp_pilot
 from dpgen.dispatcher import fp_recovery_worker as worker
 from dpgen.dispatcher import fp_vasp_monitor as vasp_monitor
+from dpgen.dispatcher import node_pool
 
 ALLOCATIONS = "allocations"
+seconds = node_pool.seconds
+hours = node_pool.hours
 RUNTIME_HISTORY = ".dpgen-fp-runtime.jsonl"
 MAX_INTERRUPTIONS = 5
 
@@ -41,34 +42,8 @@ PACK_DEFAULTS = {
     "start_margin": 600,
     "heartbeat_timeout": 600,
     "warn_before_end": 300,
+    "shared": False,
 }
-
-
-def seconds(value):
-    """Slurm-style duration (or a number of seconds) in seconds."""
-    if isinstance(value, bool):
-        raise ValueError(f"Not a duration: {value!r}")
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    match = re.fullmatch(r"(?:(\d+)-)?(\d+)(?::(\d+))?(?::(\d+))?", text)
-    if not match:
-        raise ValueError(f"Not a duration: {value!r}")
-    days, first, second, third = match.groups()
-    parts = [int(x) for x in (first, second, third) if x is not None]
-    if days is not None:
-        hours, minutes, secs = (parts + [0, 0])[:3]
-    elif len(parts) == 3:
-        hours, minutes, secs = parts
-    elif len(parts) == 2:
-        hours, minutes, secs = 0, parts[0], parts[1]
-    else:
-        hours, minutes, secs = 0, parts[0], 0
-    return float(int(days or 0) * 86400 + hours * 3600 + minutes * 60 + secs)
-
-
-def hours(value):
-    return f"{value / 3600:.1f} h"
 
 
 def pack_options(value, base_vars):
@@ -81,9 +56,16 @@ def pack_options(value, base_vars):
         )
         raise ValueError(f"Invalid fp.slurm.pack options: {unknown}")
     config = dict(PACK_DEFAULTS, **value)
-    if not isinstance(config["enabled"], bool):
-        raise ValueError("fp.slurm.pack.enabled must be boolean")
+    for key in ("enabled", "shared"):
+        if not isinstance(config[key], bool):
+            raise ValueError(f"fp.slurm.pack.{key} must be boolean")
     if not config["enabled"]:
+        # Still usable to finish allocations started before pack was switched off.
+        for key in ("time", "default_runtime"):
+            try:
+                config[f"{key}_seconds"] = seconds(config[key])
+            except ValueError:
+                config[f"{key}_seconds"] = seconds(PACK_DEFAULTS[key])
         return config
     for key in ("gpus", "max_allocations"):
         if (
@@ -236,28 +218,77 @@ def elapsed_of(task_dir, accounting=None):
     return None
 
 
+def stage_pool_config(campaign, pack):
+    """Pool settings for allocations that belong to one FP stage."""
+    return node_pool.pool_options(
+        {
+            "gpus": pack["gpus"],
+            "time": pack["time"],
+            "max_allocations": pack["max_allocations"],
+            "directives": pack["directives"],
+            "prepend": campaign.config["prepend"],
+            "vars": dict(campaign.config["vars"], iter=campaign.iter_label),
+            "python": campaign.config["python"],
+            "idle_exit": pack["idle_exit"],
+            "start_margin": pack["start_margin"],
+            "heartbeat_timeout": pack["heartbeat_timeout"],
+            "warn_before_end": pack["warn_before_end"],
+            "job_name": f"{campaign.iter_label}-fp-pack-{{allocation}}",
+            "keep": 0,  # a stage pool keeps nothing once its work is done
+            "accounting_grace": campaign.config["accounting_grace"],
+        },
+        label="fp.slurm.pack",
+    )
+
+
 class PackManager:
-    """Allocation lifecycle and task assignment for one FP stage."""
+    """Assigns one FP stage's tasks to the allocations of a node pool.
+
+    The pool is the stage's own (``02.fp/allocations``) or, with
+    ``pack.shared``, the run-wide pool that training and exploration use too.
+    """
 
     def __init__(self, campaign, config):
         self.c = campaign
         self.config = config
-        self.allocs = campaign.state.setdefault("allocations", {})
-        self.dir = campaign.root / ALLOCATIONS
+        self.shared = bool(config.get("shared"))
+        self.owner = f"fp:{campaign.iter_label}"
+        if self.shared:
+            root = node_pool.pool_root(campaign.root.parent.parent)
+            pool_config = campaign.config.get("pool") or node_pool.load_config(root)
+        else:
+            root = campaign.root / ALLOCATIONS
+            pool_config = stage_pool_config(campaign, config)
+        self.pool = node_pool.NodePool(
+            root,
+            pool_config,
+            campaign.slurm,
+            clock=campaign.clock,
+            event=lambda message, level="info": campaign.event(None, message, level),
+            dry_run=campaign.dry_run,
+            workdir=campaign.root.parent.parent,
+        )
+        self.pool.scripts = campaign.alloc_scripts
+        self.limits = pool_config
 
     # ---- helpers ---------------------------------------------------------
+
+    @property
+    def allocs(self):
+        return self.pool.allocs
 
     def _now(self):
         return self.c.clock()
 
-    def _alloc_dir(self, alloc_id):
-        return self.dir / alloc_id
+    def key(self, name):
+        return f"{self.c.iter_label}.{name}"
 
-    def _read(self, path):
-        try:
-            return json.loads(Path(path).read_text())
-        except (OSError, ValueError):
-            return None
+    def mine(self, alloc):
+        return {
+            key: item
+            for key, item in alloc.get("assigned", {}).items()
+            if item.get("owner") == self.owner
+        }
 
     def ngpus(self, name):
         value = self.c.resolve_vars(name).get("ngpus", 1)
@@ -277,7 +308,7 @@ class PackManager:
         need = self.ngpus(name)
         value, basis, confident = self.c.runtime.estimate(entry["natoms"], need)
         value *= self.config["safety_factor"]
-        ceiling = self.config["time_seconds"] - self.config["start_margin"]
+        ceiling = self.limits["time_seconds"] - self.limits["start_margin"]
         if not confident and value > ceiling:
             value, basis = ceiling, basis + "; uncertain, capped to one allocation"
         floor = entry.get("min_runtime")
@@ -286,14 +317,10 @@ class PackManager:
         return value, basis, confident
 
     def active(self):
-        return {
-            alloc_id: alloc
-            for alloc_id, alloc in self.allocs.items()
-            if alloc["status"] in ("submitting", "queued", "running")
-        }
+        return self.pool.active()
 
     def assigned_gpus(self, alloc):
-        return sum(item["ngpus"] for item in alloc.get("assigned", {}).values())
+        return self.pool.used_gpus(alloc)
 
     def assignable(self):
         tasks = self.c.state["tasks"]
@@ -311,152 +338,25 @@ class PackManager:
 
     # ---- allocations -----------------------------------------------------
 
-    def render(self, alloc_id):
-        context = dict(
-            self.c.config["vars"],
-            gpus=self.config["gpus"],
-            time=self.config["time"],
-            iter=self.c.iter_label,
-            allocation=alloc_id,
-        )
-        directory = self._alloc_dir(alloc_id)
-        python = self.c.config["python"] or os.path.realpath(
-            __import__("sys").executable
-        )
-        job_name = f"{self.c.iter_label}-fp-pack-{alloc_id}"
-        lines = [
-            "#!/bin/bash",
-            f"#SBATCH --job-name={job_name}",
-            "#SBATCH --output=slurm-%j.out",
-            f"#SBATCH --chdir={directory}",
-            f"#SBATCH --signal=B:USR1@{int(self.config['warn_before_end'])}",
-        ]
-        lines += [f"#SBATCH {d.format_map(context)}" for d in self.config["directives"]]
-        lines += [
-            "",
-            f"# dpgen FP {self.c.iter_label} allocation {alloc_id}: "
-            f"{self.config['gpus']} GPU(s) for {self.config['time']}; runs several",
-            "# single points side by side. Tasks are assigned only after it starts.",
-            "",
-        ]
-        lines += [line.format_map(context) for line in self.c.config["prepend"]]
-        lines += [
-            f"cd {self.c._quote(str(directory))}",
-            f"exec {self.c._quote(python)} fp_pilot.py --gpus {self.config['gpus']} "
-            f"--time-limit {int(self.config['time_seconds'])} "
-            f"--idle-exit {int(self.config['idle_exit'])} --python {self.c._quote(python)}",
-            "",
-        ]
-        return job_name, "\n".join(lines)
-
-    def submit_allocation(self, reason):
-        number = len(self.allocs) + 1
-        alloc_id = f"A{number:02d}"
-        directory = self._alloc_dir(alloc_id)
-        job_name, script = self.render(alloc_id)
-        alloc = {
-            "id": alloc_id,
-            "job_id": None,
-            "job_name": job_name,
-            "status": "submitting",
-            "gpus": self.config["gpus"],
-            "time_limit": self.config["time_seconds"],
-            "submitted_at": self._now(),
-            "dir": str(directory),
-            "assigned": {},
-            "reason": reason,
-        }
-        self.allocs[alloc_id] = alloc
-        if self.c.dry_run:
-            self.c.alloc_scripts[alloc_id] = script
-        else:
-            directory.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(fp_pilot.__file__, directory / "fp_pilot.py")
-            (directory / "alloc.sbatch").write_text(script)
-        self.c.save()
-        from dpgen.dispatcher.fp_slurm import SubmitRejected, SubmitUncertain
-
-        try:
-            job_id = self.c.slurm.submit("alloc.sbatch", cwd=str(directory))
-        except SubmitRejected as exc:
-            alloc.update(status="rejected", reason=f"sbatch rejected: {exc}")
-            self.c.state["pack_blocked_until"] = self._now() + 600
-            self.c.event(
-                None,
-                f"allocation {alloc_id} rejected by sbatch: {exc}; retrying in 10 min",
-                "error",
-            )
-            return
-        except SubmitUncertain as exc:
-            self.c.event(
-                None,
-                f"allocation {alloc_id}: sbatch outcome unknown ({exc})",
-                "warning",
-            )
-            return
-        alloc.update(job_id=job_id, status="queued")
-        self.c.event(
-            None,
-            f"requested allocation {alloc_id} as job {job_id} "
-            f"({self.config['gpus']} GPU × {self.config['time']}): {reason}",
-        )
-
-    def _resolve_submitting(self, alloc, queue):
-        directory = alloc["dir"]
-        found = [
-            j
-            for j, job in queue.items()
-            if self.c._same_path(job["workdir"], directory)
-        ]
-        if not found:
-            try:
-                found = self.c.slurm.find(directory, alloc["submitted_at"] - 300)
-            except Exception:  # noqa: BLE001 — accounting may lag; retry next pass
-                return
-        if found:
-            alloc.update(job_id=found[-1], status="queued")
-            self.c.event(
-                None,
-                f"allocation {alloc['id']}: found job {found[-1]} after uncertain sbatch",
-            )
-        elif self._now() - alloc["submitted_at"] > self.c.config["accounting_grace"]:
-            alloc.update(status="not_submitted")
-            self.c.event(
-                None,
-                f"allocation {alloc['id']}: no job was created; it will be requested again",
-            )
-
     def update(self, queue):
-        for alloc in list(self.active().values()):
-            if alloc["status"] == "submitting":
-                self._resolve_submitting(alloc, queue)
+        self.pool.update(queue)
+        for alloc in self.pool.allocs.values():
+            if not self.mine(alloc):
                 continue
-            job = queue.get(str(alloc["job_id"]))
-            status = self._read(Path(alloc["dir"]) / "status.json") or {}
-            if status:
-                alloc.update(
-                    started=status.get("started"),
-                    deadline=status.get("deadline"),
-                    heartbeat=status.get("time"),
-                    node=status.get("node"),
-                )
-            if job is not None:
-                alloc["status"] = "queued" if job["state"] == "PENDING" else "running"
             self.collect(alloc)
-            if job is None:
+            if alloc["status"] not in node_pool.ACTIVE:
                 self.end(alloc)
 
     def collect(self, alloc):
-        directory = Path(alloc["dir"])
         tasks = self.c.state["tasks"]
-        for path in sorted((directory / "running").glob("*.json")):
-            name = path.stem
+        for key, item in list(self.mine(alloc).items()):
+            name = item.get("task")
             entry = tasks.get(name)
-            record = self._read(path)
-            if not entry or not record or name not in alloc["assigned"]:
+            if entry is None:
                 continue
+            record = self.pool.read(alloc, "running", key)
             attempt = entry["attempts"][-1]
-            if attempt.get("started_at") is None:
+            if record and attempt.get("started_at") is None:
                 attempt.update(
                     started_at=record.get("start"),
                     gpus=record.get("gpus"),
@@ -468,16 +368,10 @@ class PackManager:
                     f"started in allocation {alloc['id']} (job {alloc['job_id']}) "
                     f"on GPU {','.join(record.get('gpus', []))}",
                 )
-        for path in sorted((directory / "finished").glob("*.json")):
-            name = path.stem
-            record = self._read(path)
-            if record is None or name not in alloc["assigned"]:
+            record = self.pool.read(alloc, "finished", key)
+            if record is None:
                 continue
-            item = alloc["assigned"].pop(name)
-            if not self.c.dry_run:
-                done = directory / "processed"
-                done.mkdir(exist_ok=True)
-                os.replace(path, done / f"{name}.a{item['attempt']}.json")
+            self.pool.release(alloc, key, suffix=f".a{item.get('attempt')}")
             self.finish_task(name, alloc, record)
 
     def finish_task(self, name, alloc, record):
@@ -563,13 +457,13 @@ class PackManager:
         )
 
     def end(self, alloc):
-        """The allocation left the queue: settle every task still assigned to it."""
-        if alloc["status"] == "ended":
-            return
-        self.collect(alloc)
-        alloc.update(status="ended", ended=self._now())
-        for name, item in list(alloc["assigned"].items()):
-            entry = self.c.state["tasks"][name]
+        """The allocation left the queue: settle this stage's tasks still on it."""
+        for key, item in list(self.mine(alloc).items()):
+            name = item.get("task")
+            alloc["assigned"].pop(key)
+            entry = self.c.state["tasks"].get(name)
+            if entry is None:
+                continue
             attempt = entry["attempts"][-1]
             started = attempt.get("started_at")
             if started:
@@ -586,9 +480,7 @@ class PackManager:
                     "not_started": True,
                     "reason": f"allocation {alloc['id']} ended before it started",
                 }
-            alloc["assigned"].pop(name)
             self.finish_task(name, alloc, record)
-        self.c.event(None, f"allocation {alloc['id']} (job {alloc['job_id']}) ended")
 
     # ---- assignment ------------------------------------------------------
 
@@ -597,7 +489,13 @@ class PackManager:
         task = self.c.root / name
         number = (entry["attempts"][-1]["n"] if entry["attempts"] else 0) + 1
         archived = self.c._archive(name)
-        _, command, values, _ = self.c.render(name, number)
+        _, command, values, script = self.c.render(name, number)
+        # Same environment and worker as fp.sbatch, without the #SBATCH lines.
+        lines = [line for line in script.splitlines() if not line.startswith("#SBATCH")]
+        for index in range(len(lines) - 1, -1, -1):
+            if lines[index].endswith("fp_recovery_worker.py"):
+                lines[index] = "exec " + lines[index]
+                break
         if not self.c.dry_run:
             shutil.copyfile(worker.__file__, task / "fp_recovery_worker.py")
             if self.c.monitor["enabled"]:
@@ -611,6 +509,7 @@ class PackManager:
                     "validated_input_digest": None,
                 },
             )
+            (task / "fp-pilot.sh").write_text("\n".join(lines) + "\n")
         attempt = {
             "n": number,
             "allocation": alloc["id"],
@@ -623,23 +522,17 @@ class PackManager:
         }
         entry["attempts"].append(attempt)
         entry.update(status="queued", reason=f"assigned to {alloc['id']}")
-        alloc["assigned"][name] = {
-            "ngpus": need,
-            "attempt": number,
-            "estimate": estimate,
-        }
-        if not self.c.dry_run:
-            fp_pilot.atomic_json(
-                Path(alloc["dir"]) / "inbox" / f"{name}.json",
-                {
-                    "name": name,
-                    "task_dir": str(task),
-                    "attempt": number,
-                    "ngpus": need,
-                    "estimate": round(estimate),
-                    "assigned_at": self._now(),
-                },
-            )
+        self.pool.assign(
+            alloc,
+            self.key(name),
+            cwd=task,
+            argv=["bash", "fp-pilot.sh"],
+            ngpus=need,
+            estimate=estimate,
+            owner=self.owner,
+            task=name,
+            attempt=number,
+        )
         self.c.event(
             name,
             f"assigned to allocation {alloc['id']} (job {alloc['job_id']}): "
@@ -647,15 +540,7 @@ class PackManager:
         )
 
     def place(self, pending):
-        running = [
-            a
-            for a in self.active().values()
-            if a["status"] == "running"
-            and a.get("deadline")
-            and a.get("heartbeat")
-            and self._now() - a["heartbeat"] <= self.config["heartbeat_timeout"]
-            and not (Path(a["dir"]) / "drain").exists()
-        ]
+        running = self.pool.running()
         order = sorted(pending, key=lambda n: -self.estimate(n)[0])  # longest first
         placed = set()
         for name in order:
@@ -670,26 +555,24 @@ class PackManager:
                 continue
             need = self.ngpus(name)
             estimate, basis, _ = self.estimate(name)
-            if need > self.config["gpus"]:
+            if need > self.limits["gpus"]:
                 entry.update(
                     status="held",
-                    reason=f"needs {need} GPUs; allocations have {self.config['gpus']}",
+                    reason=f"needs {need} GPUs; allocations have {self.limits['gpus']}",
                 )
                 self.c.event(name, entry["reason"], "error")
                 placed.add(name)
                 continue
-            if estimate + self.config["start_margin"] > self.config["time_seconds"]:
+            if estimate + self.limits["start_margin"] > self.limits["time_seconds"]:
                 entry.update(
                     status="held",
-                    reason=f"estimate {hours(estimate)} exceeds the allocation time {self.config['time']}",
+                    reason=f"estimate {hours(estimate)} exceeds the allocation time {self.limits['time']}",
                 )
                 self.c.event(name, entry["reason"], "error")
                 placed.add(name)
                 continue
-            for alloc in sorted(running, key=lambda a: a["deadline"]):
-                free = alloc["gpus"] - self.assigned_gpus(alloc)
-                remaining = alloc["deadline"] - self._now()
-                if need <= free and estimate + self.config["start_margin"] <= remaining:
+            for alloc in running:
+                if self.pool.fits(alloc, need, estimate):
                     self.assign(name, alloc, need, estimate, basis)
                     placed.add(name)
                     break
@@ -698,90 +581,43 @@ class PackManager:
     # ---- demand ----------------------------------------------------------
 
     def balance(self, waiting):
-        active = self.active()
-        if not waiting:
-            for alloc in active.values():
-                if (
-                    alloc["status"] == "queued"
-                    and not alloc["assigned"]
-                    and alloc.get("job_id")
-                ):
-                    alloc["status_note"] = "not needed"
-                    try:
-                        self.c.slurm.cancel(alloc["job_id"], pending_only=True)
-                        self.c.event(
-                            None,
-                            f"allocation {alloc['id']} no longer needed; cancelling it while pending",
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        self.c.event(
-                            None,
-                            f"could not cancel allocation {alloc['id']}: {exc}",
-                            "warning",
-                        )
-                elif alloc["status"] == "running" and not alloc["assigned"]:
-                    flag = Path(alloc["dir"]) / "drain"
-                    if not flag.exists():
-                        if not self.c.dry_run:
-                            flag.write_text("no work left\n")
-                        self.c.event(
-                            None,
-                            f"allocation {alloc['id']} has no work left; asked it to exit",
-                        )
-            return
-        for alloc in active.values():
-            flag = Path(alloc["dir"]) / "drain"
-            if flag.exists() and not self.c.dry_run:
-                flag.unlink()
-        if self._now() < self.c.state.get("pack_blocked_until", 0):
-            return
-        demand = sum(self.ngpus(n) for n in waiting)
-        spare = sum(
-            a["gpus"] - self.assigned_gpus(a)
-            for a in active.values()
-            if a["status"] != "running"
+        shortest = min((self.estimate(n)[0] for n in waiting), default=0)
+        self.pool.balance(
+            sum(self.ngpus(n) for n in waiting), len(waiting), "fp", shortest
         )
-        if len(active) < self.config["max_allocations"] and demand > spare:
-            self.submit_allocation(
-                f"{len(waiting)} task(s) waiting, {demand} GPU(s) needed"
-            )
 
     def step(self, queue):
         self.update(queue)
         pending = self.assignable()
         waiting = self.place(pending)
         self.balance(waiting)
+        self.pool.save()
 
     def cancel_task(self, name, then):
         entry = self.c.state["tasks"][name]
         attempt = entry["attempts"][-1]
         alloc = self.allocs.get(attempt.get("allocation"))
         attempt["cancel_intent"] = then
-        if alloc is None or name not in alloc.get("assigned", {}):
+        if alloc is None or self.key(name) not in alloc.get("assigned", {}):
             return False
-        if not self.c.dry_run:
-            fp_pilot.atomic_json(
-                Path(alloc["dir"]) / "cancel" / f"{name}.json", {"intent": then}
-            )
+        self.pool.cancel(alloc, self.key(name), then)
         self.c.event(name, f"asked allocation {alloc['id']} to stop it ({then})")
         return True
 
 
-def summary_rows(state):
-    rows = []
-    for alloc_id, alloc in sorted(state.get("allocations", {}).items()):
-        remaining = (alloc.get("deadline") or 0) - time.time()
-        rows.append(
-            {
-                "allocation": alloc_id,
-                "job_id": alloc.get("job_id") or "-",
-                "status": alloc["status"],
-                "node": alloc.get("node") or "-",
-                "gpus": f"{sum(i['ngpus'] for i in alloc.get('assigned', {}).values())}/{alloc['gpus']} busy",
-                "time_left": hours(remaining)
-                if alloc["status"] == "running" and remaining > 0
-                else "-",
-                "tasks": ", ".join(sorted(alloc.get("assigned", {}))) or "-",
-            }
-        )
-    return rows
+def stage_pools(stage_root):
+    """Pool states on disk that may hold this FP stage's allocations."""
+    stage_root = Path(stage_root)
+    found = []
+    for root in (
+        stage_root / ALLOCATIONS,
+        node_pool.pool_root(stage_root.parent.parent),
+    ):
+        state = node_pool.read_state(root)
+        if state is not None:
+            found.append((root, state))
+    return found
+
+
+def summary_rows(allocs, now=None):
+    return node_pool.summary_rows(allocs, now)

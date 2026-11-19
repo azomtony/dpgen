@@ -63,6 +63,82 @@ def local_submission(resources, commands, work_path, run_tasks, outlog, errlog):
     )
 
 
+ENVIRONMENT_KEYS = (
+    "prepend_script",
+    "module_purge",
+    "module_unload_list",
+    "module_list",
+    "source_list",
+    "envs",
+)
+COMMAND_NAMES = {0: "train", 1: "freeze", 2: "compress"}
+
+
+def environment_lines(resources, group=None):
+    """Shell lines that set up a stage's environment from its resources."""
+    lines = ["set -e"]
+    lines.extend(resources.get("prepend_script", []))
+    if resources.get("module_purge", False):
+        lines.append("module purge")
+    lines.extend(
+        "module unload " + shlex.quote(module)
+        for module in resources.get("module_unload_list", [])
+    )
+    lines.extend(
+        "module load " + shlex.quote(module)
+        for module in resources.get("module_list", [])
+    )
+    lines.extend(
+        "source " + shlex.quote(source) for source in resources.get("source_list", [])
+    )
+    for key, value in resources.get("envs", {}).items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise ValueError(f"Invalid environment variable name: {key}")
+        lines.append(f"export {key}={shlex.quote(str(value))}")
+    if group is not None:
+        # Set this last so stage setup cannot overwrite the task's allocation.
+        lines.append("export CUDA_VISIBLE_DEVICES=" + ",".join(map(str, group)))
+    return lines
+
+
+def command_name(work_path, index, count):
+    if Path(work_path).name == "00.train" and index < count:
+        return COMMAND_NAMES.get(index, "command")
+    return "command"
+
+
+def command_resources(resources, name):
+    """Stage resources with ``command_envs[name]`` applied (envs are merged)."""
+    override = resources.get("command_envs", {}).get(name, {})
+    merged = {**resources, **override}
+    merged["envs"] = {**resources.get("envs", {}), **override.get("envs", {})}
+    return merged
+
+
+def split_command_envs(resources, commands, work_path):
+    """Give each command its own environment, as ``--gpus`` mode does.
+
+    For a batch scheduler: every command runs in a fresh ``bash -c`` with the
+    stage environment plus its ``command_envs`` entry (``train``, ``freeze``,
+    ``compress``), so the training environment never leaks into freeze. The
+    environment keys are removed from the returned resources.
+    """
+    if not resources.get("command_envs"):
+        return list(commands), resources
+    wrapped = []
+    for index, command in enumerate(commands):
+        name = command_name(work_path, index, len(commands))
+        setup = environment_lines(command_resources(resources, name))
+        setup.append(command)
+        wrapped.append("bash -c " + shlex.quote("\n".join(setup)))
+    stripped = {
+        key: value
+        for key, value in resources.items()
+        if key not in ENVIRONMENT_KEYS + ("command_envs",)
+    }
+    return wrapped, stripped
+
+
 class LocalSubmission:
     """Blocking stage executor with exclusive GPU slots and process cleanup."""
 
@@ -135,29 +211,7 @@ class LocalSubmission:
         return resume, keys
 
     def _environment_lines(self, group, resources):
-        lines = ["set -e"]
-        lines.extend(resources.get("prepend_script", []))
-        if resources.get("module_purge", False):
-            lines.append("module purge")
-        lines.extend(
-            "module unload " + shlex.quote(module)
-            for module in resources.get("module_unload_list", [])
-        )
-        lines.extend(
-            "module load " + shlex.quote(module)
-            for module in resources.get("module_list", [])
-        )
-        lines.extend(
-            "source " + shlex.quote(source)
-            for source in resources.get("source_list", [])
-        )
-        for key, value in resources.get("envs", {}).items():
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                raise ValueError(f"Invalid environment variable name: {key}")
-            lines.append(f"export {key}={shlex.quote(str(value))}")
-        # Set this last so stage setup cannot overwrite the task's allocation.
-        lines.append("export CUDA_VISIBLE_DEVICES=" + ",".join(map(str, group)))
-        return lines
+        return environment_lines(resources, group)
 
     def _script(self, group, directory=None, resume=0, keys=None):
         resources = self.resources

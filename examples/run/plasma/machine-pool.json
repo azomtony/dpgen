@@ -1,0 +1,60 @@
+{
+  "pool": {
+    "gpus": 4,
+    "time": "24:00:00",
+    "max_allocations": {"train": 1, "model_devi": 1, "fp": 2},
+    "vars": {"partition": "PARTITION", "account": "ACCOUNT"},
+    "directives": [
+      "--partition={partition}",
+      "--account={account}",
+      "--nodes=1",
+      "--ntasks-per-node={gpus}",
+      "--gres=gpu:{gpus}",
+      "--mem=0",
+      "--time={time}"
+    ],
+    "prepend": ["export OMP_NUM_THREADS=1"],
+    "idle_exit": 1800,
+    "keep": 1,
+    "renew_before": "06:00:00",
+    "runtime": {"train": "06:00:00", "model_devi": "01:00:00"}
+  },
+  "train": {
+    "command": "dp",
+    "machine": {"batch_type": "Pilot", "context_type": "LazyLocalContext", "local_root": "./"},
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 8,
+      "gpu_per_node": 1,
+      "queue_name": "pool",
+      "group_size": 1,
+      "source_list": ["/path/to/deepmd-env.sh"]
+    }
+  },
+  "model_devi": {
+    "command": "lmp",
+    "machine": {"batch_type": "Pilot", "context_type": "LazyLocalContext", "local_root": "./"},
+    "resources": {
+      "number_node": 1,
+      "cpu_per_node": 8,
+      "gpu_per_node": 1,
+      "queue_name": "pool",
+      "group_size": 10,
+      "source_list": ["/path/to/deepmd-env.sh"]
+    }
+  },
+  "fp": {
+    "command": "vasp_std",
+    "machine": {"batch_type": "Slurm", "context_type": "LazyLocalContext", "local_root": "./"},
+    "resources": {"group_size": 1},
+    "slurm": {
+      "enabled": true,
+      "site": "empire",
+      "vars": {"ngpus": 1},
+      "prepend": ["source /path/to/vasp-env.sh"],
+      "command": "mpirun --bind-to none -np {ngpus} /path/to/vasp.6.6.1/bin/vasp_std",
+      "escalate": {"resource": {"ngpus": [2, 4]}},
+      "pack": {"enabled": true, "shared": true, "default_runtime": "02:00:00"}
+    }
+  }
+}

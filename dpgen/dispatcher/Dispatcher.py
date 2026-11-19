@@ -5,6 +5,8 @@ from dargs.dargs import Argument
 from dpdispatcher import Machine, Resources, Submission, Task
 from packaging.version import Version
 
+from dpgen.dispatcher import pilot_machine  # noqa: F401  registers batch_type "Pilot"
+
 
 def make_submission(
     mdata_machine,
@@ -37,6 +39,11 @@ def make_submission(
     abs_mdata_machine = mdata_machine.copy()
     abs_mdata_machine["local_root"] = abs_local_root
 
+    from dpgen.dispatcher.interactive import split_command_envs
+
+    # resources.command_envs (e.g. a separate environment for `dp freeze`):
+    # each command gets its own shell, as in --gpus mode.
+    commands, mdata_resources = split_command_envs(mdata_resources, commands, work_path)
     machine = Machine.load_from_dict(abs_mdata_machine)
     resources = Resources.load_from_dict(mdata_resources)
 

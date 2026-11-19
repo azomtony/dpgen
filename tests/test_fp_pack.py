@@ -165,7 +165,7 @@ class TestPack(unittest.TestCase):
         return campaign.state["tasks"][name]
 
     def alloc(self, campaign, alloc_id="A01"):
-        return campaign.state["allocations"][alloc_id]
+        return campaign._pack().allocs[alloc_id]
 
     def start_allocation(self, campaign, alloc_id="A01", time_limit=86400):
         alloc = self.alloc(campaign, alloc_id)
@@ -317,7 +317,7 @@ class TestPack(unittest.TestCase):
         self.start_allocation(campaign, time_limit=3600)  # 1 h left < estimate+margin
         campaign.step()
         self.assertEqual(self.entry(campaign, self.small)["status"], "pending")
-        self.assertIn("A02", campaign.state["allocations"])
+        self.assertIn("A02", campaign._pack().allocs)
 
     def test_drains_idle_allocation_and_cancels_unneeded_pending_one(self):
         campaign = self.campaign(pack={"max_allocations": 2})
@@ -326,7 +326,7 @@ class TestPack(unittest.TestCase):
         campaign.step()
         self.tick(pilot)
         campaign.step()
-        campaign.state["allocations"]["A02"] = dict(
+        campaign._pack().allocs["A02"] = dict(
             self.alloc(campaign),
             id="A02",
             status="queued",
@@ -358,7 +358,7 @@ class TestPack(unittest.TestCase):
         self.assertEqual(self.slurm.cancelled, [])
         self.assertTrue(
             (
-                Path(self.alloc(campaign)["dir"]) / "cancel" / f"{self.small}.json"
+                Path(self.alloc(campaign)["dir"]) / "cancel" / f"i004.{self.small}.json"
             ).exists()
         )
         self.tick(pilot)  # worker stops the task
@@ -388,6 +388,31 @@ class TestPack(unittest.TestCase):
         self.assertIn("2 task(s) wait for a running allocation", text)
         self.assertIn("default_runtime", text)
         self.assertIn("--bind-to", text)
+
+    def test_live_and_summary_logs(self):
+        campaign = self.campaign()
+        campaign.step()
+        campaign.report()
+        pilot = self.start_allocation(campaign)
+        campaign.step()
+        self.tick(pilot)
+        campaign.step()
+        campaign.report()
+        self.complete(pilot, self.small)
+        self.complete(pilot, self.big)
+        self.tick(pilot)
+        campaign.step()
+        campaign.report()
+        live = (self.base / "dpgen-live.log").read_text().splitlines()
+        self.assertIn("FP i004 | 0/2 finished: pending 2 | nodes A01 queued", live[0])
+        self.assertIn("running 2 | nodes A01 3/4 GPU", live[1])
+        summary = (self.base / "dpgen-summary.log").read_text()
+        self.assertIn("node A01 (job 500) started", summary)
+        self.assertIn("iter.000004  FP complete: 2 of 2 done", summary)
+        campaign.report()  # completion is written once
+        self.assertEqual(
+            (self.base / "dpgen-summary.log").read_text().count("FP complete"), 1
+        )
 
     def test_runtime_model(self):
         path = self.base / "history.jsonl"

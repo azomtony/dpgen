@@ -1,4 +1,8 @@
-"""Allocation worker: runs assigned FP tasks side by side on one allocation's GPUs.
+"""Allocation worker: runs assigned jobs side by side on one allocation's GPUs.
+
+Jobs are FP single points (``fp_recovery_worker.py`` by default) or any command
+given as ``argv`` in the assignment, such as a dpdispatcher job script for
+training or exploration.
 
 Copied into ``02.fp/allocations/<id>/`` and started by that allocation's
 ``alloc.sbatch``. It needs only the Python standard library. The controller
@@ -216,9 +220,11 @@ class Pilot:
             environment = dict(self.environment)
             environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
             environment["DPGEN_ALLOCATION"] = str(self.root)
-            log = open(task / f"fp-pilot-{self.job_id or 'local'}.log", "a")
+            log_name = assignment.get("log") or f"fp-pilot-{self.job_id or 'local'}.log"
+            log = open(task / log_name, "a")
+            argv = assignment.get("argv") or [self.python, "fp_recovery_worker.py"]
             process = self.popen(
-                [self.python, "fp_recovery_worker.py"],
+                list(argv),
                 cwd=str(task),
                 env=environment,
                 stdout=log,
