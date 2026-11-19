@@ -329,7 +329,10 @@ class TestNodePool(unittest.TestCase):
         submission.run_submission(exit_on_submit=True, clean=False)
         out = io.StringIO()
         node_pool.command(
-            SimpleNamespace(WORKDIR=str(self.work), all=False, drain=False), out
+            SimpleNamespace(
+                WORKDIR=str(self.work), all=False, drain=False, retry=False
+            ),
+            out,
         )
         text = out.getvalue()
         self.assertIn("A01", text)
@@ -401,6 +404,51 @@ class TestNodePool(unittest.TestCase):
         self.assertEqual(pool.items["i002.train.x.1"]["status"], "waiting")
         self.assertTrue((Path(old["dir"]) / "drain").exists())
         self.assertIn("A02", pool.allocs)  # its successor takes the job
+
+    def test_node_that_just_started_counts_and_is_not_drained(self):
+        pool = self.pool()
+        pool.enqueue(
+            "i002.train.x.1", kind="train", cwd=self.work, argv=["true"], ngpus=8
+        )
+        pool.items["i002.train.x.1"]["ngpus"] = 4
+        for _ in range(3):
+            pool.enqueue(
+                f"i002.train.y.{_}", kind="train", cwd=self.work, argv=["true"], ngpus=4
+            )
+        pool.step_items(self.slurm.queue())
+        alloc = pool.allocs["A01"]
+        self.slurm.jobs[alloc["job_id"]]["state"] = "RUNNING"  # no heartbeat yet
+        for _ in range(3):
+            pool.step_items(self.slurm.queue())
+        self.assertEqual(sorted(pool.allocs), ["A01"])  # limit train=1 respected
+        self.assertFalse((Path(alloc["dir"]) / "drain").exists())
+
+    def test_repeated_failed_starts_stop_requests(self):
+        pool = self.pool()
+        pool.enqueue("i002.fp.x.1", kind="fp", cwd=self.work, argv=["true"], ngpus=1)
+        for expected in ("A01", "A02"):
+            pool.step_items(self.slurm.queue())
+            alloc = pool.allocs[expected]
+            (Path(alloc["dir"]) / f"slurm-{alloc['job_id']}.out").write_text(
+                "python3.12: No such file or directory\n"
+            )
+            del self.slurm.jobs[alloc["job_id"]]  # the job died at once
+            pool.step_items(self.slurm.queue())
+        self.assertIn("ended before the pilot started", pool.state["halted"])
+        count = len(pool.allocs)
+        pool.step_items(self.slurm.queue())
+        self.assertEqual(len(pool.allocs), count)  # no more requests
+        import io
+        from types import SimpleNamespace
+
+        out = io.StringIO()
+        args = SimpleNamespace(
+            WORKDIR=str(self.work), all=False, drain=False, retry=False
+        )
+        node_pool.command(args, out)
+        self.assertIn("NODE REQUESTS STOPPED", out.getvalue())
+        node_pool.command(SimpleNamespace(**{**vars(args), "retry": True}), out)
+        self.assertNotIn("halted", self.pool().state)
 
     def test_pool_options(self):
         config = node_pool.pool_options(POOL)

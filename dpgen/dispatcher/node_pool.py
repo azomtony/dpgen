@@ -300,7 +300,10 @@ class NodePool:
         return alloc["gpus"] - self.used_gpus(alloc)
 
     def remaining(self, alloc):
-        return (alloc.get("deadline") or 0) - self.clock()
+        """Seconds left; a node not started or not yet checked in has its full time."""
+        if alloc.get("deadline"):
+            return alloc["deadline"] - self.clock()
+        return alloc.get("time_limit", self.config["time_seconds"])
 
     def running(self):
         """Started, healthy allocations that accept new work, soonest end first."""
@@ -456,6 +459,7 @@ class NodePool:
                     heartbeat=status.get("time"),
                     node=status.get("node"),
                 )
+                self.state["failed_starts"] = 0
             if job is not None:
                 before = alloc["status"]
                 alloc["status"] = "queued" if job["state"] == "PENDING" else "running"
@@ -477,6 +481,7 @@ class NodePool:
             else:
                 alloc.update(status="ended", ended=self.clock())
                 self.event(f"allocation {alloc['id']} (job {alloc['job_id']}) ended")
+                self._check_failed_start(alloc)
                 if alloc.get("started"):
                     ran = self.clock() - alloc["started"]
                     self._milestone(
@@ -486,6 +491,30 @@ class NodePool:
                         alloc,
                         ran=round(ran),
                     )
+
+    def _check_failed_start(self, alloc):
+        """A node that ran but whose pilot never checked in: stop after two."""
+        output = Path(alloc["dir"]) / f"slurm-{alloc['job_id']}.out"
+        if alloc.get("heartbeat") or alloc.get("cancel_requested"):
+            return
+        if not output.exists():
+            return  # never started (e.g. cancelled while pending)
+        count = self.state.get("failed_starts", 0) + 1
+        self.state["failed_starts"] = count
+        self.event(
+            f"allocation {alloc['id']} (job {alloc['job_id']}) ended before its pilot "
+            f"started; see {output}",
+            "error",
+        )
+        if count >= 2:
+            self.state["halted"] = (
+                f"{count} nodes in a row ended before the pilot started (last: {output}). "
+                "Fix the cause (often pool.python or pool.prepend), then run "
+                "`dpgen pool --retry`."
+            )
+            self.event(
+                f"no more nodes will be requested: {self.state['halted']}", "error"
+            )
 
     def _milestone(self, event, message, alloc, **data):
         if not self.dry_run:
@@ -595,7 +624,9 @@ class NodePool:
                     )
             elif flag.exists() and not self.dry_run:
                 flag.unlink()
-        if self.clock() < self.state.get("blocked_until", 0):
+        if self.clock() < self.state.get("blocked_until", 0) or self.state.get(
+            "halted"
+        ):
             return
         spare = sum(
             self.free_gpus(a) for a in active.values() if a["status"] != "running"
@@ -680,7 +711,9 @@ class NodePool:
             for a in active.values()
         ):
             return
-        if self.clock() < self.state.get("blocked_until", 0):
+        if self.clock() < self.state.get("blocked_until", 0) or self.state.get(
+            "halted"
+        ):
             return
         ending = min(active.values(), key=lambda a: self.remaining(a))
         self.submit_allocation(
@@ -875,6 +908,17 @@ def command(args, out=sys.stdout):
     state = read_state(root)
     if state is None:
         raise SystemExit(f"No node pool ({STATE}) under {root}")
+    if getattr(args, "retry", False):
+        state.pop("halted", None)
+        state["failed_starts"] = 0
+        fp_pilot.atomic_json(root / STATE, state)
+        print(
+            "Node requests allowed again; dpgen requests nodes at its next check.",
+            file=out,
+        )
+        return
+    if state.get("halted"):
+        print(f"NODE REQUESTS STOPPED: {state['halted']}\n", file=out)
     if args.drain:
         for alloc in state["allocations"].values():
             if alloc["status"] in ACTIVE and Path(alloc["dir"]).is_dir():
@@ -931,6 +975,11 @@ def add_parser(subparsers):
     parser.add_argument("WORKDIR", nargs="?", help="dpgen run directory (default: .)")
     parser.add_argument(
         "--all", action="store_true", help="also list finished and cancelled jobs"
+    )
+    parser.add_argument(
+        "--retry",
+        action="store_true",
+        help="allow node requests again after they were stopped by failed starts",
     )
     parser.add_argument(
         "--drain",
