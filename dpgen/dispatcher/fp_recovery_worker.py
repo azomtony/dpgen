@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -351,6 +352,18 @@ def run_attempt(
         )
         assert process.stdout is not None
         if monitor is not None:
+            # VASP runs in its own process group here, so a stop sent to this
+            # wrapper (allocation preemption, cancellation) must be passed on.
+            def forward(signum, frame):
+                try:
+                    os.killpg(process.pid, signum)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+            try:
+                signal.signal(signal.SIGTERM, forward)
+            except ValueError:
+                pass  # not the main thread
             monitor.start(process)
         try:
             for line in process.stdout:

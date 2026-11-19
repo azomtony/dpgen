@@ -28,15 +28,43 @@
       "prepend": [
         "module load vasp/6.4.3-gpu"
       ],
-      "command": "mpirun -np {ngpus} vasp_std",
+      "command": "mpirun --bind-to none -np {ngpus} vasp_std",
       "rules": [
-        {"min_natoms": 400, "vars": {"ngpus": 2}}
+        {
+          "min_natoms": 400,
+          "vars": {
+            "ngpus": 2
+          }
+        }
       ],
       "escalate": {
-        "resource": {"ngpus": [2, 4]},
-        "timeout": {"time": ["48:00:00"]}
+        "resource": {
+          "ngpus": [
+            2,
+            4
+          ]
+        },
+        "timeout": {
+          "time": [
+            "48:00:00"
+          ]
+        }
       },
-      "on_exhausted": "hold"
+      "on_exhausted": "hold",
+      "pack": {
+        "enabled": false,
+        "gpus": 4,
+        "time": "24:00:00",
+        "max_allocations": 2,
+        "directives": [
+          "--partition={partition}",
+          "--nodes=1",
+          "--ntasks-per-node={gpus}",
+          "--gres=gpu:{gpus}",
+          "--time={time}"
+        ],
+        "default_runtime": "02:00:00"
+      }
     }
   }
 }

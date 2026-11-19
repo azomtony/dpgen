@@ -64,6 +64,10 @@ class FakeSlurm:
         self.fail_next = None
         self.create_then_fail = False
         self.start_before_cancel = False
+        self.cluster_name = None
+
+    def cluster(self):
+        return self.cluster_name
 
     def submit(self, script, cwd):
         assert (Path(cwd) / script).exists()
@@ -282,6 +286,102 @@ class TestFPSlurm(unittest.TestCase):
         campaign = self.start()
         self.assertEqual(self.entry(campaign, self.small)["status"], "done")
         self.assertEqual([w for _, w in self.slurm.history], [str(self.task(self.big))])
+
+    def test_stage_moved_to_another_cluster(self):
+        self.slurm.cluster_name = "delta"
+        campaign = self.start()
+        self.assertEqual(campaign.state["cluster"], "delta")
+        small_job = self.slurm.job_in(self.small)
+        # On delta: the small job finished after the controller last looked;
+        # the big one was still pending with leftovers from an earlier try.
+        (self.task(self.small) / "OUTCAR").write_text("GOOD")
+        (self.task(self.big) / "OUTCAR").write_text("partial")
+        # Copied to empire: none of delta's jobs exist there.
+        self.slurm = FakeSlurm()
+        self.slurm.cluster_name = "empire"
+        self.slurm.next_id = 900
+        with self.assertRaisesRegex(RuntimeError, "--moved"):
+            self.campaign().initialize(self.slurm.queue())
+        self.assertEqual(self.slurm.history, [])
+
+        config = options(dict(CONFIG))
+        moved = Campaign(
+            self.root,
+            config,
+            {"fp_style": "vasp"},
+            slurm=self.slurm,
+            clock=self.clock,
+            sleep=self.clock.sleep,
+            validator=good,
+            moved=True,
+        )
+        moved.initialize(self.slurm.queue())
+        moved.step()
+        small, big = self.entry(moved, self.small), self.entry(moved, self.big)
+        self.assertEqual(small["status"], "done")
+        self.assertIn("finished on delta", small["reason"])
+        self.assertEqual(
+            json.loads((self.task(self.small) / "fp-done.json").read_text())["job_id"],
+            small_job,
+        )
+        self.assertEqual([w for _, w in self.slurm.history], [str(self.task(self.big))])
+        self.assertEqual(big["status"], "queued")
+        self.assertEqual(big["attempts"][0]["category"], "moved")
+        self.assertEqual(big["retries"], {})
+        self.assertEqual(
+            (self.task(self.big) / "attempts/001/OUTCAR").read_text(), "partial"
+        )
+        self.assertEqual(moved.state["cluster"], "empire")
+        self.assertEqual(moved.state["moves"][0]["from"], "delta")
+        self.assertIn(
+            "Cancel the remaining jobs", (self.root / "fp-events.log").read_text()
+        )
+
+        # Resuming on empire later needs no flag; going back is refused while
+        # empire jobs are active, and allowed once everything finished.
+        self.campaign().initialize(self.slurm.queue())
+        self.slurm.cluster_name = "delta"
+        with self.assertRaisesRegex(RuntimeError, "empire"):
+            self.campaign().initialize(self.slurm.queue())
+        self.slurm.cluster_name = "empire"
+        (self.task(self.big) / "OUTCAR").write_text("GOOD")
+        self.slurm.end(self.slurm.job_in(self.big), "COMPLETED")
+        moved.step()
+        self.assertTrue(moved.complete())
+        self.slurm.cluster_name = "delta"
+        back = self.campaign()
+        back.initialize(self.slurm.queue())
+        self.assertEqual(back.state["cluster"], "delta")
+
+    def test_released_task_accepts_results_copied_in(self):
+        campaign = self.start()
+        job = self.slurm.job_in(self.small)
+        queue_request(self.root, "hold", [self.small], cancel=True)
+        campaign.step()
+        campaign.step()
+        self.assertEqual(self.slurm.cancelled, [job])
+        self.assertEqual(self.entry(campaign, self.small)["status"], "held")
+        (self.task(self.small) / "OUTCAR").write_text("GOOD")  # run elsewhere
+        submitted = len(self.slurm.history)
+        queue_request(self.root, "release", [self.small])
+        campaign.step()
+        self.assertEqual(self.entry(campaign, self.small)["status"], "done")
+        self.assertEqual(len(self.slurm.history), submitted)
+
+    def test_changed_inputs_never_label_old_outputs(self):
+        campaign = self.start()
+        queue_request(self.root, "hold", [self.small], cancel=True)
+        campaign.step()
+        campaign.step()
+        (self.task(self.small) / "OUTCAR").write_text("GOOD")  # from old inputs
+        (self.task(self.small) / "INCAR").write_text("INCAR KPAR=2")
+        campaign = self.campaign()
+        campaign.initialize(self.slurm.queue())
+        self.assertFalse((self.task(self.small) / "OUTCAR").exists())
+        self.assertEqual(
+            (self.task(self.small) / "attempts/inputs-changed/OUTCAR").read_text(),
+            "GOOD",
+        )
 
     def test_uncertain_sbatch_recovers_created_job_without_duplicate(self):
         self.slurm.fail_next = SubmitUncertain("socket timed out")

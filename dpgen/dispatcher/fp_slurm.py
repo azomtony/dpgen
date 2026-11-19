@@ -45,6 +45,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from dpgen import dlog
+from dpgen.dispatcher import fp_pack
 from dpgen.dispatcher import fp_recovery_worker as worker
 from dpgen.dispatcher import fp_vasp_monitor as vasp_monitor
 
@@ -113,6 +114,8 @@ DEFAULTS = {
     "on_exhausted": "hold",
     "protect_outputs": True,
     "update_pending": True,
+    "site": "default",  # name used for runtime history (one per cluster later)
+    "pack": {},
 }
 META_KEYS = ("iter", "task", "sys", "natoms", "formula", "attempt")
 
@@ -192,6 +195,9 @@ def options(value):
     config["retry"] = retry
     if config["on_exhausted"] not in ("hold", "fail"):
         raise ValueError("fp.slurm.on_exhausted must be 'hold' or 'fail'")
+    if not isinstance(config["site"], str) or not config["site"]:
+        raise ValueError("fp.slurm.site must be a non-empty string")
+    config["pack"] = fp_pack.pack_options(config["pack"], config["vars"])
     for key in ("protect_outputs", "update_pending"):
         if not isinstance(config[key], bool):
             raise ValueError(f"fp.slurm.{key} must be boolean")
@@ -315,6 +321,15 @@ class Slurm:
         if re.search(r"time(?:d)?\s*out|socket|connection|try again", error, re.I):
             raise SubmitUncertain(f"sbatch: {error}")
         raise SubmitRejected(error or output or f"sbatch exit {result.returncode}")
+
+    def cluster(self):
+        """Slurm ClusterName of this login node, or None if it cannot be read."""
+        try:
+            result = self._call(["scontrol", "show", "config"], timeout=60)
+        except SlurmError:
+            return None
+        match = re.search(r"^\s*ClusterName\s*=\s*(\S+)", result.stdout or "", re.M)
+        return match[1] if match else None
 
     def queue(self):
         """Jobs of this user still known to the controller: id -> state/workdir/name."""
@@ -505,6 +520,11 @@ def read_requests(root):
     return json.loads(path.read_text())
 
 
+def _cluster_of(slurm):
+    getter = getattr(slurm, "cluster", None)
+    return getter() if callable(getter) else None
+
+
 class DryRunSlurm:
     """Reads the real queue and accounting; records submissions and cancels."""
 
@@ -515,6 +535,9 @@ class DryRunSlurm:
 
     def queue(self):
         return self.real.queue()
+
+    def cluster(self):
+        return _cluster_of(self.real)
 
     def accounting(self, job_ids):
         return self.real.accounting(job_ids)
@@ -545,9 +568,11 @@ class Campaign:
         sleep=time.sleep,
         validator=None,
         dry_run=False,
+        moved=False,
     ):
         from dpgen.dispatcher.fp_recovery import validate_vasp_outputs
 
+        self.moved = moved  # stage was copied here from another cluster
         self.root = Path(root).resolve()
         self.config = config
         self.jdata = jdata or {}
@@ -566,6 +591,22 @@ class Campaign:
         self.view = {}  # task -> directory read in place of the task (dry run)
         if dry_run:
             self.slurm = DryRunSlurm(self.slurm)
+        self.alloc_scripts = {}  # allocation id -> alloc.sbatch text (dry run)
+        self.pack = None
+        pack = config.get("pack") or {}
+        self.runtime = fp_pack.RuntimeModel(
+            self.root.parent.parent / fp_pack.RUNTIME_HISTORY,
+            pack.get("default_runtime_seconds", 7200),
+            config.get("site", "default"),
+        )
+
+    @staticmethod
+    def _quote(text):
+        return _shell_quote(text)
+
+    @staticmethod
+    def _same_path(left, right):
+        return _same_path(left, right)
 
     # ---- persistence -----------------------------------------------------
 
@@ -638,6 +679,7 @@ class Campaign:
         path = self.root / STATE
         if path.exists():
             self.state = json.loads(path.read_text())
+            self._check_cluster()
             self._reconcile_inputs()
             return
         self.state = {"version": 1, "created": self.clock(), "tasks": {}}
@@ -652,14 +694,106 @@ class Campaign:
                     self._mark_done(
                         name, None, "valid results present before submission"
                     )
+        here = _cluster_of(self.slurm)
+        if here:
+            self.state["cluster"] = here
         self.save()
         self.event(None, f"campaign initialized with {len(self.state['tasks'])} tasks")
+
+    # ---- moving a stage between clusters ----------------------------------
+
+    def _tracks_jobs(self):
+        tasks = self.state["tasks"].values()
+        allocations = self.state.get("allocations", {}).values()
+        return any(e["status"] in ACTIVE or e.get("submitting") for e in tasks) or any(
+            a.get("status") in ("submitting", "queued", "running") for a in allocations
+        )
+
+    def _check_cluster(self):
+        """Refuse to treat another cluster's job IDs as ours; adopt a moved stage."""
+        here = _cluster_of(self.slurm)
+        before = self.state.get("cluster")
+        if self.moved:
+            self._move_here(before or "the previous cluster", here or "this cluster")
+        elif before and here and before != here:
+            if self._tracks_jobs():
+                raise RuntimeError(
+                    f"This FP stage was last run on cluster {before!r}, and this is "
+                    f"{here!r}. Its queued/running jobs belong to {before}. If you "
+                    "copied the stage here to finish it, run once with --moved "
+                    "(`dpgen fp run PARAM MACHINE --moved`). Nothing was submitted."
+                )
+            self.event(
+                None, f"stage moved from {before} to {here}; no jobs were active"
+            )
+        if here:
+            self.state["cluster"] = here
+
+    def _move_here(self, before, here):
+        """Forget the other cluster's jobs; keep every result that validates.
+
+        A task whose job finished there before the copy becomes done; any other
+        unfinished task is submitted again here (its partial outputs are archived
+        first, as for any retry). Held, failed, stopped and discarded tasks keep
+        their status. Moving never uses up a retry.
+        """
+        now = self.clock()
+        resubmit, finished = [], []
+        for name, entry in self.state["tasks"].items():
+            if entry["status"] in TERMINAL:
+                continue
+            if entry["status"] not in ACTIVE and not entry.get("submitting"):
+                continue
+            attempt = entry["attempts"][-1] if entry["attempts"] else None
+            if attempt is not None and "ended" not in attempt:
+                attempt.update(
+                    category="moved",
+                    reason=f"stage moved from {before} to {here}",
+                    ended=now,
+                )
+            for key in ("submitting", "left_queue_at", "foreign_warned"):
+                entry.pop(key, None)
+            if self._reusable_outputs(name):
+                self._mark_done(name, attempt, f"finished on {before} before the move")
+                finished.append(name)
+                continue
+            entry.update(
+                status="pending",
+                retry_after=0,
+                reason=f"moved from {before}; job there no longer tracked",
+            )
+            resubmit.append(name)
+        for alloc in self.state.get("allocations", {}).values():
+            if alloc.get("status") in ("submitting", "queued", "running"):
+                alloc.update(status="ended", ended=now, reason=f"moved from {before}")
+        jobs_left = len(resubmit)
+        self.event(
+            None,
+            f"stage moved from {before} to {here}: {len(finished)} task(s) finished "
+            f"there before the copy, {jobs_left} unfinished task(s) will run here. "
+            f"Cancel the remaining jobs of this stage on {before}.",
+            "warning" if jobs_left else "info",
+        )
+        self.state.setdefault("moves", []).append(
+            {
+                "from": before,
+                "to": here,
+                "time": now,
+                "finished": finished,
+                "resubmit": resubmit,
+            }
+        )
+        self.moved = False
 
     def _refuse_untracked_jobs(self, queue, roots):
         tracked = {
             str(attempt.get("job_id"))
             for entry in (self.state or {}).get("tasks", {}).values()
             for attempt in entry.get("attempts", [])
+        }
+        tracked |= {
+            str(alloc.get("job_id"))
+            for alloc in (self.state or {}).get("allocations", {}).values()
         }
         stray = sorted(
             job_id
@@ -728,7 +862,17 @@ class Campaign:
                     )
                 entry["input_digest"] = digest
                 entry["natoms"], entry["formula"] = poscar_info(task / "POSCAR")
-                self.event(name, "inputs changed; next attempt uses the new inputs")
+                # Outputs in the folder belong to the old inputs: never label them.
+                archived = self._archive(name, label="inputs-changed")
+                self.event(
+                    name,
+                    "inputs changed; next attempt uses the new inputs"
+                    + (
+                        f" (old outputs kept in {archived.relative_to(task)})"
+                        if archived
+                        else ""
+                    ),
+                )
 
     def _verify_done(self, name):
         record_path = self.root / name / DONE
@@ -746,6 +890,11 @@ class Campaign:
     def _has_valid_outputs(self, name):
         task = Path(self.view.get(name, self.root / name))
         return (task / "OUTCAR").exists() and self.validate(task)[0]
+
+    def _reusable_outputs(self, name):
+        """Valid results that may become labels (not stopped by the FP monitor)."""
+        task = Path(self.view.get(name, self.root / name))
+        return self._has_valid_outputs(name) and _stop_reason(task) is None
 
     def _mark_done(self, name, attempt, reason):
         entry = self.state["tasks"][name]
@@ -773,6 +922,19 @@ class Campaign:
                 path = task / filename
                 path.chmod(path.stat().st_mode & ~0o222)
         entry.update(status="done", reason=reason)
+        if attempt:
+            ngpus = (attempt.get("vars") or {}).get("ngpus", 1)
+            try:
+                ngpus = int(ngpus)
+            except (TypeError, ValueError):
+                ngpus = 1
+            self.runtime.record(
+                entry["natoms"],
+                ngpus,
+                fp_pack.elapsed_of(task, {"elapsed": attempt.get("elapsed")}),
+                name,
+                dry_run=self.dry_run,
+            )
         entry.pop("retry_after", None)
         self.event(
             name,
@@ -1031,6 +1193,10 @@ class Campaign:
         entry = self.state["tasks"][name]
         attempt = entry["attempts"][-1]
         job_id = attempt.get("job_id")
+        if attempt.get("allocation"):
+            # Never scancel a shared allocation: ask its worker to stop this task.
+            self._pack().cancel_task(name, then)
+            return
         attempt["cancel_intent"] = then
         try:
             self.slurm.cancel(job_id)
@@ -1102,6 +1268,7 @@ class Campaign:
         entry = self.state["tasks"][name]
         present = [f for f in OUTPUT_FILES if (task / f).exists()]
         present += sorted(p.name for p in task.glob("slurm-*.out"))
+        present += sorted(p.name for p in task.glob("fp-pilot-*.log"))
         if not present:
             return None
         if label is None:
@@ -1128,7 +1295,7 @@ class Campaign:
     def submit(self, name, queue):
         entry = self.state["tasks"][name]
         task = self.root / name
-        if self._has_valid_outputs(name) and not vasp_monitor.stopped_task(task):
+        if self._reusable_outputs(name):
             self._mark_done(
                 name,
                 entry["attempts"][-1] if entry["attempts"] else None,
@@ -1324,7 +1491,12 @@ class Campaign:
         job_id = attempt.get("job_id")
         report = self._attempt_report(task, job_id)
         evidence = ""
-        for filename in ("fp-runtime.log", f"slurm-{job_id}.out", "fp.log"):
+        for filename in (
+            "fp-runtime.log",
+            f"slurm-{job_id}.out",
+            f"fp-pilot-{job_id}.log",
+            "fp.log",
+        ):
             try:
                 evidence += (task / filename).read_text(errors="replace")[
                     -16000:
@@ -1455,6 +1627,8 @@ class Campaign:
                 self._resolve_uncertain(name, queue)
                 continue
             if entry["status"] in ACTIVE:
+                if entry["attempts"][-1].get("allocation"):
+                    continue  # tracked through its allocation
                 job_id = str(entry["attempts"][-1].get("job_id"))
                 if job_id in queue:
                     pending = queue[job_id]["state"] == "PENDING"
@@ -1499,14 +1673,28 @@ class Campaign:
                 entry.pop("left_queue_at", None)
                 self.finish(name, row)
                 self.save()
-        for name, entry in tasks.items():
-            if entry["status"] == "pending" and not entry.get("submitting"):
-                if entry.get("hold"):
-                    entry.update(status="held", reason="held by user")
-                    continue
-                if self.clock() >= entry.get("retry_after", 0):
-                    self.submit(name, queue)
+        if self.config["pack"]["enabled"]:
+            self._pack().step(queue)
+        else:
+            if any(
+                a["status"] in ("submitting", "queued", "running")
+                for a in self.state.get("allocations", {}).values()
+            ):
+                # Pack mode was switched off: finish tracking what runs there.
+                self._pack().update(queue)
+            for name, entry in tasks.items():
+                if entry["status"] == "pending" and not entry.get("submitting"):
+                    if entry.get("hold"):
+                        entry.update(status="held", reason="held by user")
+                        continue
+                    if self.clock() >= entry.get("retry_after", 0):
+                        self.submit(name, queue)
         self.save()
+
+    def _pack(self):
+        if self.pack is None:
+            self.pack = fp_pack.PackManager(self, self.config["pack"])
+        return self.pack
 
     def complete(self):
         return all(e["status"] in TERMINAL for e in self.state["tasks"].values())
@@ -1638,7 +1826,8 @@ def status_rows(state, config=None):
                     " (hold)" if entry.get("hold") and entry["status"] != "held" else ""
                 ),
                 "attempt": attempt.get("n", 0),
-                "job_id": attempt.get("job_id") or "-",
+                "job_id": (attempt.get("job_id") or "-")
+                + (f" ({attempt['allocation']})" if attempt.get("allocation") else ""),
                 "resources": _fmt_vars(attempt.get("vars") or {}),
                 "reason": (entry.get("reason") or "")
                 .replace("\t", " ")
@@ -1648,13 +1837,13 @@ def status_rows(state, config=None):
     return rows
 
 
-def run_campaign(work_path, jdata, mdata, slurm=None):
+def run_campaign(work_path, jdata, mdata, slurm=None, moved=False):
     if jdata.get("fp_style") != "vasp":
         raise ValueError("fp.slurm currently supports fp_style='vasp' only")
     config = options(mdata.get("fp_slurm"))
     if not config["enabled"]:
         raise RuntimeError("fp.slurm must be enabled to resume this FP campaign")
-    counts = Campaign(work_path, config, jdata, slurm=slurm).run()
+    counts = Campaign(work_path, config, jdata, slurm=slurm, moved=moved).run()
     if counts.get("failed"):
         dlog.warning(
             "FP: %d task(s) failed and are excluded from labels; ratio_failed applies",
@@ -1676,21 +1865,31 @@ STEP_NAMES = (
 )
 
 
-def plan_stage(root, jdata, mdata, slurm=None, out=sys.stdout, validator=None):
+def plan_stage(
+    root, jdata, mdata, slurm=None, out=sys.stdout, validator=None, moved=False
+):
     """Print what the controller would do for one FP stage; change nothing.
 
     Returns 0 when the stage would proceed and 1 when it would stop.
     """
     config = options(mdata.get("fp_slurm"))
     campaign = Campaign(
-        root, config, jdata, slurm=slurm or Slurm(), validator=validator, dry_run=True
+        root,
+        config,
+        jdata,
+        slurm=slurm or Slurm(),
+        validator=validator,
+        dry_run=True,
+        moved=moved,
     )
     print(f"\n== FP plan: {campaign.root} ==", file=out)
     if not campaign._task_dirs():
         print("No task.* directories: run_fp would have nothing to do.", file=out)
         return 0
     mode = (
-        "resume existing campaign"
+        "take over a stage copied from another cluster"
+        if moved and (campaign.root / STATE).exists()
+        else "resume existing campaign"
         if (campaign.root / STATE).exists()
         else "adopt previous recovery controller's jobs"
         if (campaign.root / LEGACY_LEDGER).exists()
@@ -1751,6 +1950,56 @@ def plan_stage(root, jdata, mdata, slurm=None, out=sys.stdout, validator=None):
                 file=out,
             )
             print(campaign.scripts[name].rstrip(), file=out)
+
+    pack = campaign.config["pack"]
+    if pack["enabled"]:
+        print(
+            f"\nAllocations: up to {pack['max_allocations']} × {pack['gpus']} GPU for "
+            f"{pack['time']}; tasks are assigned only to allocations that have started.",
+            file=out,
+        )
+        allocs = campaign.state.get("allocations", {})
+        rows = fp_pack.summary_rows(campaign.state)
+        if rows:
+            for row in rows:
+                print(
+                    f"  {row['allocation']}  job {row['job_id']:<10} {row['status']:<10} "
+                    f"{row['gpus']:<10} left {row['time_left']:<7} {row['tasks']}",
+                    file=out,
+                )
+        waiting = [
+            n for n, e in campaign.state["tasks"].items() if e["status"] == "pending"
+        ]
+        if waiting:
+            print(
+                f"\n{len(waiting)} task(s) wait for a running allocation. Estimates:",
+                file=out,
+            )
+            for name in sorted(waiting)[:20]:
+                entry = campaign.state["tasks"][name]
+                value, basis, _ = campaign._pack().estimate(name)
+                print(
+                    f"  {name}  {entry['natoms']:>5} at  {campaign._pack().ngpus(name)} GPU  "
+                    f"{fp_pack.hours(value):>7}  ({basis})",
+                    file=out,
+                )
+            if len(waiting) > 20:
+                print(f"  … and {len(waiting) - 20} more", file=out)
+        command = campaign.config["command"]
+        if "mpirun" in command and "bind-to" not in command:
+            print(
+                "\n! fp.slurm.command uses mpirun without --bind-to. With several tasks "
+                "in one allocation, Open MPI binds every task's ranks to the same cores. "
+                "Use `mpirun --bind-to none -np {ngpus} ...`.",
+                file=out,
+            )
+        for alloc_id, script in campaign.alloc_scripts.items():
+            print(
+                f"\n--- alloc.sbatch that would be written for allocation {alloc_id} ---",
+                file=out,
+            )
+            print(script.rstrip(), file=out)
+        del allocs
 
     counts = campaign.summary()
     print(
@@ -2000,16 +2249,35 @@ def _print_table(rows, out=sys.stdout):
         print("  ".join(str(row[c]).ljust(widths.get(c, 0)) for c in columns), file=out)
 
 
+def _stage_arg(value):
+    here = Path.cwd()
+    if not value and here.name != "02.fp" and not (here / "02.fp").is_dir():
+        return find_stage(None)  # latest iter.*/02.fp with a campaign
+    stage = Path(value or here).resolve()
+    if stage.name != "02.fp" and (stage / "02.fp").is_dir():
+        stage = stage / "02.fp"
+    if not stage.is_dir():
+        raise SystemExit(f"{stage} is not a directory")
+    return stage
+
+
 def command(args):
-    if args.fp_action == "plan":
+    if args.fp_action in ("plan", "run"):
         from dpgen.remote.decide_machine import convert_mdata
         from dpgen.util import load_file
 
-        stage = Path(args.STAGE or ".").resolve()
-        if stage.name != "02.fp" and (stage / "02.fp").is_dir():
-            stage = stage / "02.fp"
+        stage = _stage_arg(args.STAGE)
+        jdata = load_file(args.param)
         mdata = convert_mdata(load_file(args.machine))
-        raise SystemExit(plan_stage(stage, load_file(args.param), mdata))
+        moved = getattr(args, "moved", False)
+        if args.fp_action == "plan" or args.dry_run:
+            raise SystemExit(plan_stage(stage, jdata, mdata, moved=moved))
+        counts = run_campaign(stage, jdata, mdata, moved=moved)
+        print(
+            f"FP stage {stage} complete: "
+            + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        )
+        return
     root = find_stage(args.STAGE)
     state = json.loads((root / STATE).read_text())
     if args.fp_action == "status":
@@ -2029,6 +2297,16 @@ def command(args):
             + ": "
             + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
         )
+        allocations = fp_pack.summary_rows(state)
+        if allocations:
+            print(
+                "\nALLOCATION  JOB_ID      STATUS     NODE        GPUS        LEFT     TASKS"
+            )
+            for row in allocations:
+                print(
+                    f"{row['allocation']:<10}  {row['job_id']:<10}  {row['status']:<9}  "
+                    f"{row['node']:<10}  {row['gpus']:<10}  {row['time_left']:<7}  {row['tasks']}"
+                )
         pending = read_requests(root)["requests"]
         if pending:
             print(
@@ -2114,6 +2392,28 @@ def add_parser(subparsers):
     plan.add_argument("STAGE", nargs="?")
     plan.add_argument("--machine", required=True, help="machine.json")
     plan.add_argument("--param", required=True, help="param.json")
+    plan.add_argument(
+        "--moved",
+        action="store_true",
+        help="preview taking over a stage copied from another cluster",
+    )
+    run = actions.add_parser(
+        "run",
+        help="Run the controller for one FP stage until every task is finished "
+        "(no other workflow step), e.g. on another cluster",
+    )
+    run.add_argument("STAGE", nargs="?", help="iter.XXXXXX or iter.XXXXXX/02.fp")
+    run.add_argument("--machine", required=True, help="machine.json for THIS cluster")
+    run.add_argument("--param", required=True, help="param.json")
+    run.add_argument(
+        "--moved",
+        action="store_true",
+        help="the stage was copied here from another cluster: forget the job IDs "
+        "there, keep results that validate, run the unfinished tasks here",
+    )
+    run.add_argument(
+        "--dry-run", action="store_true", help="show what would happen; change nothing"
+    )
     status = actions.add_parser("status", help="Show a table of FP tasks")
     status.add_argument("STAGE", nargs="?")
     status.add_argument("--status", nargs="+", default=[])

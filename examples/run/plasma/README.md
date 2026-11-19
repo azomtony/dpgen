@@ -768,3 +768,57 @@ completion. Results in the old hash staging directory are *copied* into the
 task (the staging directory is left untouched). Tasks that exhausted retries
 under the old controller are held. Only unfinished tasks get new jobs, in the
 new layout.
+
+## Several single points per allocation (`fp.slurm.pack`)
+
+Long allocations queue once and then run many single points, instead of one
+Slurm job per single point. Add `pack` inside `fp.slurm`:
+
+```json
+"pack": {
+  "enabled": true,
+  "gpus": 4,
+  "time": "24:00:00",
+  "max_allocations": 2,
+  "directives": ["--partition={partition}", "--account={account}", "--nodes=1",
+                 "--ntasks-per-node={gpus}", "--gres=gpu:{gpus}", "--mem=0", "--time={time}"],
+  "default_runtime": "02:00:00"
+}
+```
+
+and launch VASP without core binding, since several tasks share the node:
+`"command": "mpirun --bind-to none -np {ngpus} .../vasp_std"`.
+
+How it works:
+
+- **Requests:** while FP tasks wait, the controller keeps up to `max_allocations`
+  allocations queued or running. Each runs `allocations/A01/fp_pilot.py`.
+- **Assignment:** tasks go only to allocations that have *started*, so queued
+  allocations hold no work. Each task gets its own GPUs (`CUDA_VISIBLE_DEVICES`)
+  according to `ngpus` from your rules, overrides and escalation. Tasks needing the
+  most GPUs, and the longest ones, go first.
+- **Time:** a task starts only if its estimated runtime plus `start_margin`
+  (10 min) fits the allocation's remaining time. Estimates come from
+  `.dpgen-fp-runtime.jsonl` in the workflow folder, which records every validated
+  single point in either mode. With history close to a task's size, an estimate
+  above the allocation length holds the task. A rough or default estimate is
+  capped to one allocation instead, so the task still runs. `safety_factor`
+  (1.3) pads every estimate.
+- **Results:** each task is collected and validated as soon as it ends, not when
+  the allocation ends. A failure follows the usual rules (OOM escalates `ngpus`,
+  and so on), and the retry goes to any allocation with room.
+- **Stops:** preemption or the wall-time warning (`--signal=B:USR1@300`) makes the
+  worker stop running tasks and report them as interrupted. They go back on the
+  list without using a retry, and their estimate is raised to at least the time
+  they already ran. Tasks assigned but not started go back too.
+- **Release:** when no work remains, idle allocations are asked to exit (`drain`),
+  and allocations still queued are cancelled while pending. A worker also exits
+  after `idle_exit` (15 min) with nothing to run, so idle GPUs aren't charged.
+- **Changing a running task:** `dpgen fp set ... --resubmit`, `hold --cancel` and
+  `discard` stop only that task inside its allocation. The allocation keeps
+  running its other tasks.
+
+`dpgen fp status` lists allocations (job, node, busy GPUs, time left, tasks), and
+`--dry-run` shows the allocation script and each waiting task's estimate.
+Turning `pack` off later is safe: tasks already in allocations are tracked to
+the end, and new work goes back to one job per task.
