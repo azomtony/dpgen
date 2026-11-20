@@ -206,6 +206,15 @@ def make_stage_submission(
     if not isinstance(supplied, dict):
         raise ValueError("job_recovery must be an object")
     config = options({"fp_recovery": supplied})
+    if config["enabled"] and machine.get("batch_type") == "Pilot":
+        # The node pool already resubmits failed jobs and requeues jobs stopped
+        # by preemption or the end of an allocation.
+        dlog.info(
+            "%s: job_recovery is not used with batch_type Pilot; the node pool "
+            "handles retries",
+            stage,
+        )
+        return (ordinary_factory or make_submission)(machine, resources, **builder)
     if not config["enabled"]:
         return (ordinary_factory or make_submission)(machine, resources, **builder)
     if machine.get("batch_type") != "Slurm":

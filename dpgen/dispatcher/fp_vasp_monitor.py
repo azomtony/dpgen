@@ -147,6 +147,14 @@ def scf_record(line):
         return None
 
 
+def _median(values):
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
 class Monitor:
     """Watch live stdout and OSZICAR; STOPCAR first, own process group last."""
 
@@ -218,12 +226,14 @@ class Monitor:
                     max(abs(row["de"]), abs(row["deps"]))
                     for row in self.records[-2 * window :]
                 ]
-                old, new = min(errors[:window]), min(errors[window:])
+                # Median, not minimum: an oscillating dE crosses zero now and
+                # then, and one such lucky step must not hide real progress.
+                old, new = _median(errors[:window]), _median(errors[window:])
                 if new > ediff * self.policy["unconverged_factor"] and new >= old * (
                     1 - self.policy["min_relative_improvement"]
                 ):
                     self._stop(
-                        f"SCF stagnation over {2 * window} steps: best energy error {old:.6g} -> {new:.6g} eV, EDIFF={ediff:.6g}"
+                        f"SCF stagnation over {2 * window} steps: median energy error {old:.6g} -> {new:.6g} eV, EDIFF={ediff:.6g}"
                     )
 
     def _stop(self, reason):

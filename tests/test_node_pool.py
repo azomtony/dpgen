@@ -450,6 +450,38 @@ class TestNodePool(unittest.TestCase):
         node_pool.command(SimpleNamespace(**{**vars(args), "retry": True}), out)
         self.assertNotIn("halted", self.pool().state)
 
+    def test_job_recovery_is_skipped_for_pilot(self):
+        from dpgen.dispatcher.stage_recovery import make_stage_submission
+
+        stage, tasks = self.stage("00.train", 1)
+        submission = make_stage_submission(
+            {"job_recovery": {"enabled": True}},
+            "train",
+            {
+                "batch_type": "Pilot",
+                "context_type": "LazyLocalContext",
+                "local_root": "./",
+            },
+            {
+                "number_node": 1,
+                "cpu_per_node": 1,
+                "gpu_per_node": 1,
+                "queue_name": "pool",
+                "group_size": 1,
+            },
+            ordinary_factory=make_submission,
+            commands=["true"],
+            work_path=str(stage.relative_to(self.work)),
+            run_tasks=tasks,
+            group_size=1,
+            forward_common_files=[],
+            forward_files=[],
+            backward_files=[],
+            outlog="train.log",
+            errlog="train.log",
+        )
+        self.assertEqual(type(submission.machine).__name__, "Pilot")
+
     def test_pool_options(self):
         config = node_pool.pool_options(POOL)
         self.assertEqual(config["time_seconds"], 86400)

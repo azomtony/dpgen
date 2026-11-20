@@ -116,6 +116,67 @@ class TestVaspMonitor(unittest.TestCase):
             monitor.feed(row(step, error))
         self.assertIn("stagnation", monitor.reason)
 
+    def test_slowly_converging_rmm_with_zero_crossing_continues(self):
+        # Cu-O task.020.000033: dE fell ~10x over steps 31-70, but step 50
+        # crossed zero (|dE| 0.0019); the old best-value rule stopped it.
+        monitor = self.monitor(
+            stagnation_window=20, min_scf_steps=60, max_scf_steps=200
+        )
+        history = [
+            (0.69507, -0.81294e-2),
+            (0.98873e-1, -0.10834e-2),
+            (0.75927e-1, -0.13717e-3),
+            (0.84811e-1, -0.71415e-4),
+            (0.12215, -0.50009e-4),
+            (0.23633, -0.23273e-3),
+            (0.76752e-2, -0.12772e-4),
+            (-0.70909e-1, -0.13529e-4),
+            (-0.56709e-1, -0.10473e-4),
+            (0.24235, -0.12521e-3),
+            (0.57290, -0.12853e-2),
+            (-0.79313, -0.18201e-2),
+            (-0.65581, -0.36261e-1),
+            (0.21050, -0.29350e-2),
+            (-0.19426e-1, -0.17415e-3),
+            (0.56130e-1, -0.30286e-2),
+            (0.52187e-1, -0.66307e-3),
+            (0.17943, -0.52311e-2),
+            (-0.27049, -0.46910e-2),
+            (-0.86106e-1, -0.56171e-2),
+            (0.45088, -0.24949e-2),
+            (-0.15147, -0.79930e-2),
+            (0.28136, -0.32914e-2),
+            (-0.11985, -0.10914e-2),
+            (0.37363, -0.87889e-3),
+            (0.16146, -0.34909e-3),
+            (-0.11337, -0.57524e-3),
+            (-0.18649e-2, -0.16207e-2),
+            (0.76812e-1, -0.82878e-3),
+            (0.11696, -0.57842e-3),
+            (0.13814e-1, -0.23075e-3),
+            (-0.53288e-1, -0.41767e-3),
+            (0.20921, -0.67861e-3),
+            (-0.37060e-1, -0.26996e-3),
+            (0.95282e-1, -0.27268e-3),
+            (0.83890e-1, -0.22415e-3),
+            (0.47885e-1, -0.13134e-3),
+            (0.18050e-1, -0.26696e-3),
+            (0.81042e-2, -0.62512e-3),
+            (0.19429, -0.66868e-3),
+            (0.44290e-1, -0.52893e-3),
+            (0.66473e-1, -0.37527e-3),
+            (0.20427e-1, -0.31617e-3),
+            (-0.46827e-2, -0.30011e-3),
+            (0.13571e-1, -0.13674e-3),
+            (-0.68231e-2, -0.52460e-4),
+            (-0.72861e-2, -0.31029e-4),
+            (0.10164e-1, -0.25931e-4),
+        ]
+        for step, (de, deps) in enumerate(history, 23):
+            monitor.feed(row(step, de, deps))
+        self.assertEqual(monitor.last_step, 70)
+        self.assertIsNone(monitor.reason)
+
     def test_iteration_cap_and_last_iteration_convergence(self):
         monitor = self.monitor(max_scf_steps=3)
         for step in range(1, 4):
