@@ -387,9 +387,18 @@ def run(command, config_file="plasma.json", execute=subprocess.run):
         if planned["status"] == "complete":
             state = planned
             break
-        serial += 1
-        directory = Path("checkpoints") / f"{serial:09d}"
-        directory.mkdir()
+        # A block folder is new for every attempt. A name can already be taken
+        # by a block an earlier attempt left uncommitted, even when the listing
+        # above missed it (shared file systems list new entries late); such
+        # folders have no state.json and are never recovered, so skip them.
+        while True:
+            serial += 1
+            directory = Path("checkpoints") / f"{serial:09d}"
+            try:
+                directory.mkdir()
+                break
+            except FileExistsError:
+                continue
         (directory / "traj").mkdir()
         input_path = directory / "input.lammps"
         input_path.write_text(

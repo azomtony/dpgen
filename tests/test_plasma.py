@@ -209,6 +209,31 @@ class TestPlasma(unittest.TestCase):
         self.assertEqual(recovered["arrivals"], 4)
         self.assertEqual(len(json.loads((task / "deposition.json").read_text())), 4)
 
+    def test_retry_skips_block_folder_the_listing_missed(self):
+        # The failed attempt leaves an uncommitted block folder. On a shared
+        # file system another node may not list it yet; the retry must not
+        # stop with FileExistsError when it tries the same name.
+        task = self.make()
+        with self.assertRaisesRegex(RuntimeError, "preemption"):
+            self.run_task(task, FakeLammps(fail_call=3))
+        leftover = max(
+            path
+            for path in (task / "checkpoints").glob("[0-9]*")
+            if not (path / "state.json").exists()
+        )
+        real_glob = Path.glob
+
+        def stale_glob(self, pattern):
+            return [
+                path for path in real_glob(self, pattern) if path.name != leftover.name
+            ]
+
+        with patch.object(Path, "glob", stale_glob):
+            resumed = self.run_task(task)
+        self.assertEqual(resumed["status"], "complete")
+        self.assertEqual(resumed["arrivals"], 4)
+        self.assertFalse((leftover / "state.json").exists())
+
     def test_preemption_during_equilibration_keeps_original_target(self):
         task = self.make()
         with self.assertRaisesRegex(RuntimeError, "preemption"):
