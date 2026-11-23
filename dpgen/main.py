@@ -19,6 +19,7 @@ from dpgen.generator.finetune import gen_finetune
 from dpgen.generator.run import gen_run
 from dpgen.gui import start_dpgui
 from dpgen.simplify.simplify import gen_simplify
+from dpgen.tools.analyze import add_parser as add_analyze_parser
 from dpgen.tools.auto_gen_param import auto_gen_param
 from dpgen.tools.run_report import run_report
 from dpgen.tools.test_model import add_parser as add_test_model_parser
@@ -53,6 +54,7 @@ def main_parser() -> argparse.ArgumentParser:
     add_fp_discard_parser(subparsers)
     add_fp_parser(subparsers)
     add_pool_parser(subparsers)
+    add_analyze_parser(subparsers)
 
     # init surf model
     parser_init_surf = subparsers.add_parser(
