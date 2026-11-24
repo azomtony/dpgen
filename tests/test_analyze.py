@@ -82,7 +82,7 @@ class TestAnalyze(unittest.TestCase):
         for it, frames_count in ((0, 10), (1, 30)):
             data = root / f"iter.{it:06d}/00.train/data"
             write_system(data / "sys", frames_count)
-            for model in range(2):
+            for model in range(3):
                 task = root / f"iter.{it:06d}/00.train/{model:03d}"
                 task.mkdir(parents=True)
                 (task / "input.json").write_text(
@@ -97,14 +97,21 @@ class TestAnalyze(unittest.TestCase):
                 )
                 # still falling at the end in iter 1; flat in iter 0
                 slope = 0.0 if it == 0 else 1.0
+                # in iter 1, model 002 ends with 5x the others' energy error
+                energy = 0.05 if (it, model) == (1, 2) else 0.01
                 rows = [
-                    f"{s} 1 1 0.01 0.01 {0.1 + slope * (1000 - s) / 1e4:.5f} 0.05 1e-4\n"
+                    f"{s} 1 1 {energy} 0.01 {0.1 + slope * (1000 - s) / 1e4:.5f} 0.05 1e-4\n"
                     for s in range(0, 1001, 50)
                 ]
                 header = "#  step rmse_val rmse_trn rmse_e_val rmse_e_trn rmse_f_val rmse_f_trn lr\n"
-                # a restart re-writes the last two steps
+                # a restart writes a new header block and re-writes two steps
                 (task / "lcurve.out").write_text(
-                    header + "".join(rows[:-2] + rows[-4:])
+                    "# DeePMD-kit\n"
+                    + header
+                    + "".join(rows[:-2])
+                    + "# DeePMD-kit\n"
+                    + header
+                    + "".join(rows[-4:])
                 )
         fp = root / "iter.000001/02.fp"
         for name in ("task.000.000000", "task.000.000001", "task.000.000002"):
@@ -191,13 +198,18 @@ class TestAnalyze(unittest.TestCase):
     def test_train_reads_restarted_lcurve_and_flags_unfinished_training(self):
         notes = self.run_part("train")
         rows = read_csv(self.root / "analysis" / "train_summary.csv")
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 6)
         latest = [r for r in rows if r["iter"] == "1"]
         self.assertEqual(latest[0]["steps_done"], "1000")
         self.assertEqual(latest[0]["train_frames"], "30")
-        self.assertLess(float(latest[0]["rmse_f_val_last10pct_change"]), -0.03)
+        self.assertEqual(latest[0]["starts"], "2")
+        self.assertLess(float(latest[0]["rmse_f_val_tail_change"]), -0.05)
         self.assertTrue(any("iter 1" in n and "more steps" in n for n in notes))
-        self.assertFalse(any("iter 0" in n and "more steps" in n for n in notes))
+        self.assertTrue(any("iter 0" in n and "will not help" in n for n in notes))
+        self.assertTrue(any("started 2 times" in n for n in notes))
+        outliers = [n for n in notes if "inflate model deviation" in n]
+        self.assertEqual(len(outliers), 1)
+        self.assertIn("iter 1: model 002 rmse_e_val", outliers[0])
         self.assertTrue(any("steps per training frame 100.0" in n for n in notes))
 
     def test_fp_reports_dropped_high_deviation_frames(self):

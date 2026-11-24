@@ -193,6 +193,19 @@ def block_input(config, state, previous, directory, insertion, target, serial):
     model_list = " ".join(config["models"])
     thermostat_group = "mobile" if state["phase"] == "eq" else "bath"
     thermostat_temp = "TCu" if state["phase"] == "eq" else "Tbath"
+    if "freeze_depth" in config:
+        # Bicrystal: the grains have different layer spacings, so cut at a depth in Å.
+        freeze = (
+            f"variable zcut equal bound(copper,zmin)+{config['freeze_depth']:.17g}\n"
+        )
+    else:
+        spacing = {100: 0.5, 110: 1 / (2 * math.sqrt(2)), 111: 1 / math.sqrt(3)}[
+            config["surface"]
+        ]
+        freeze = (
+            f"variable dz equal {config['a']}*{spacing}\n"
+            "variable zcut equal bound(copper,zmin)+1.5*v_dz\n"
+        )
     text = f"""clear
 units metal
 atom_style atomic
@@ -208,9 +221,7 @@ neighbor 2.0 bin
 neigh_modify every 1 delay 0 check yes
 group copper type 1
 group oxygen type 2
-variable dz equal {config["a"]}*{ {100: 0.5, 110: 1 / (2 * math.sqrt(2)), 111: 1 / math.sqrt(3)}[config["surface"]] }
-variable zcut equal bound(copper,zmin)+1.5*v_dz
-if "${{zcut}} >= $(bound(copper,zmax))" then "quit 1"
+{freeze}if "${{zcut}} >= $(bound(copper,zmax))" then "quit 1"
 region bottom block INF INF INF INF INF ${{zcut}} units box
 group bottom_candidates region bottom
 group frozen intersect copper bottom_candidates

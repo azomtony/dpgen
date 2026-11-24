@@ -52,6 +52,7 @@ SELECTION = {
     "max_frames_per_event": 3,
     "min_time_separation": 0.01,
 }
+BICRYSTAL = "bicrystal"
 MATCH_FIELDS = (
     "eion",
     "ratio",
@@ -82,7 +83,27 @@ def settings(job, system_position=0):
                 "plasma.surface list must have one entry per sys_idx, in the same order"
             )
         options["surface"] = surface[system_position]
-    unknown = options.keys() - (DEFAULTS.keys() | {"seed"})
+    # Bicrystals have no single layer spacing, so their frozen base is a plain
+    # depth in Å. Pristine systems keep the 1.5 * dz rule and their old config.
+    depth = options.pop("freeze_depth", None)
+    if options.get("surface") == BICRYSTAL:
+        if depth is None:
+            raise ValueError('plasma.surface "bicrystal" requires plasma.freeze_depth')
+        if (
+            isinstance(depth, bool)
+            or not isinstance(depth, (int, float))
+            or not math.isfinite(depth)
+            or depth <= 0
+        ):
+            raise ValueError("plasma.freeze_depth must be a positive number in Å")
+        options["freeze_depth"] = float(depth)
+    elif depth is not None and BICRYSTAL not in (
+        surface if isinstance(surface, list) else [surface]
+    ):
+        raise ValueError(
+            'plasma.freeze_depth applies only to systems with surface "bicrystal"'
+        )
+    unknown = options.keys() - (DEFAULTS.keys() | {"seed", "freeze_depth"})
     if unknown:
         raise ValueError(f"Unknown plasma settings: {sorted(unknown)}")
     if isinstance(options.get("seed"), list):
@@ -97,7 +118,7 @@ def settings(job, system_position=0):
     for values in variants:
         config = dict(zip(keys, values))
         for key in DEFAULTS.keys() | {"seed"}:
-            if key not in config:
+            if key not in config or (key == "surface" and config[key] == BICRYSTAL):
                 continue
             value = config[key]
             if (
@@ -118,12 +139,14 @@ def settings(job, system_position=0):
             "checkpoint_freq",
             "seed",
         ):
+            if key == "surface" and config[key] == BICRYSTAL:
+                continue
             if key in config and int(config[key]) != config[key]:
                 raise ValueError(f"plasma.{key} must be an integer")
             if key in config:
                 config[key] = int(config[key])
-        if config["surface"] not in {100, 110, 111}:
-            raise ValueError("plasma.surface must be 100, 110, or 111")
+        if config["surface"] not in {100, 110, 111, BICRYSTAL}:
+            raise ValueError('plasma.surface must be 100, 110, 111, or "bicrystal"')
         if config["initial_dt"] > config["max_dt"]:
             raise ValueError("plasma.initial_dt must not exceed max_dt")
         yield config
@@ -194,6 +217,8 @@ def _signature(system, source, temperature, config):
         os.path.realpath(source),
         temperature,
         *(config[key] for key in MATCH_FIELDS),
+        # Only present for bicrystals, so pristine signatures are unchanged.
+        *(("freeze_depth", config[key]) for key in ("freeze_depth",) if key in config),
     )
 
 

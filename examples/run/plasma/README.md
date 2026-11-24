@@ -43,7 +43,7 @@ Models are loaded together using the normal DeePMD committee pair style.
 
 The initial structure must be rectangular with periodic x/y, vacuum along z,
 Cu type 1 and O type 2. The worker uses `boundary p p f`, fixes the bottom two Cu
-planes using `surface` and `a`, and follows the supplied deposition protocol:
+planes using `surface` and `a` (or a depth for bicrystals, see below), and follows the supplied deposition protocol:
 
 - Equilibrate mobile Cu for `eq_time` ps on a new trajectory branch.
 - Thermostat moving atoms in the side strips of width `edge` during exposure.
@@ -78,6 +78,31 @@ This assigns Cu(100) to system 19, Cu(110) to system 20, and Cu(111) to system 2
 The surface list is a per-system mapping, **not** a sweep. A mismatched list length
 or unsupported orientation raises an error. Each task stores its resolved scalar
 orientation, which is also used when matching trajectories for continuation.
+
+### Bicrystals
+
+A bicrystal slab (supplied POSCAR, periodic in x/y, vertical grain boundaries)
+uses `"surface": "bicrystal"`. Its grains have different layer spacings, so the
+frozen base is given as a depth instead: every Cu atom below
+`zmin(Cu) + freeze_depth` (Å) is fixed. `freeze_depth` is a single positive
+number and is not swept. Pristine and bicrystal systems can share one job:
+
+```json
+"sys_idx": [0, 1, 2],
+"plasma": {
+  "surface": [100, 111, "bicrystal"],
+  "freeze_depth": 4.0
+}
+```
+
+Here systems 0 and 1 keep the two-plane rule from `surface` and `a`, and only
+system 2 uses `freeze_depth`. `freeze_depth` without any `"bicrystal"` system
+is an error. Everything else (edge bath, deposition, selection) is the same as
+for pristine slabs. The bath is the `edge` strip along the x/y cell borders, so
+build the POSCAR with neither grain boundary on a cell border unless you want
+that boundary thermostatted. `freeze_depth` is part of continuation matching
+for bicrystal tasks only; pristine tasks match their earlier trajectories as
+before.
 
 `temps` can contain multiple temperatures. Other scalar numeric `plasma` settings
 can also be lists to generate a Cartesian sweep, for example `"eion": [5.0, 10.0]`.

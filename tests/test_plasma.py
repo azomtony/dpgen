@@ -623,6 +623,54 @@ class TestPlasma(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     [list(plasma.settings(job, i)) for i in range(3)]
 
+    def test_bicrystal_requires_positive_scalar_freeze_depth(self):
+        job = copy.deepcopy(self.job)
+        job["plasma"]["surface"] = "bicrystal"
+        for depth in (None, 0, -1.0, float("nan"), True, "4", [3.0, 4.0]):
+            with self.subTest(depth=depth):
+                job["plasma"].pop("freeze_depth", None)
+                if depth is not None:
+                    job["plasma"]["freeze_depth"] = depth
+                with self.assertRaises(ValueError):
+                    list(plasma.settings(job))
+        job["plasma"].update(surface=100, freeze_depth=4.0)
+        with self.assertRaisesRegex(ValueError, "bicrystal"):
+            list(plasma.settings(job))
+
+    def test_pristine_and_bicrystal_mix_in_one_job(self):
+        source = self.data["sys_configs"][0]
+        self.data["sys_configs"] = [source, source]
+        job = self.data["model_devi_jobs"][0]
+        job["sys_idx"] = [0, 1]
+        job["plasma"].update(surface=[100, "bicrystal"], freeze_depth=4.0)
+        self.make()
+        root = Path("iter.000000/01.model_devi")
+        pristine = json.loads((root / "task.000.000000/plasma.json").read_text())
+        bicrystal = json.loads((root / "task.001.000000/plasma.json").read_text())
+        self.assertEqual(pristine["surface"], 100)
+        self.assertNotIn("freeze_depth", pristine)
+        self.assertEqual(bicrystal["surface"], "bicrystal")
+        self.assertEqual(bicrystal["freeze_depth"], 4.0)
+        pristine_input = (root / "task.000.000000/input.lammps").read_text()
+        bicrystal_input = (root / "task.001.000000/input.lammps").read_text()
+        self.assertIn("variable zcut equal bound(copper,zmin)+1.5*v_dz", pristine_input)
+        self.assertIn("variable zcut equal bound(copper,zmin)+4\n", bicrystal_input)
+        self.assertNotIn("v_dz", bicrystal_input)
+        # The safety check against freezing the whole slab applies to both.
+        for text in (pristine_input, bicrystal_input):
+            self.assertIn('if "${zcut} >= $(bound(copper,zmax))" then "quit 1"', text)
+
+    def test_freeze_depth_only_changes_bicrystal_signatures(self):
+        config = dict(plasma.DEFAULTS)
+        before = plasma._signature(0, "POSCAR", 293.0, config)
+        self.assertEqual(len(before), 3 + len(plasma.MATCH_FIELDS))
+        bicrystal = dict(config, surface="bicrystal", freeze_depth=4.0)
+        deeper = dict(bicrystal, freeze_depth=5.0)
+        self.assertNotEqual(
+            plasma._signature(0, "POSCAR", 293.0, bicrystal),
+            plasma._signature(0, "POSCAR", 293.0, deeper),
+        )
+
     def test_fractional_budgets_scale_and_round_to_total(self):
         job = copy.deepcopy(self.job)
         job["selection"] = {

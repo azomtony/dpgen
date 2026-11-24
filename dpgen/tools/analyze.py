@@ -368,30 +368,56 @@ def data_frames(task, section, cache):
 
 
 def lcurve_metrics(names, rows):
+    """Robust end-of-training values from a noisy lcurve.
+
+    Each lcurve row is the error of one batch, so single rows swing by a
+    factor of several. Medians over a fifth of the run are stable enough to
+    compare models and iterations.
+    """
     if not rows:
         return {}
     table = np.asarray(rows)
     n = len(table)
-    tail = max(1, n // 20)
-    window = max(1, n // 10)
+    window = max(1, n // 5)
     result = {"steps_done": int(table[-1, 0])}
     for name in ("rmse_f_val", "rmse_f_trn", "rmse_e_val", "rmse_e_trn", "lr"):
         if name not in names:
             continue
         column = table[:, names.index(name)]
-        result[name] = float(column[-tail:].mean())
-        if name.endswith("_val") or (
-            name.endswith("_trn") and f"{name[:-4]}_val" not in names
-        ):
-            if n >= 2 * window and name != "lr":
-                before = column[-2 * window : -window].mean()
-                after = column[-window:].mean()
-                # Relative change over the last tenth of training; clearly
-                # negative means the error was still falling when it stopped.
-                result[f"{name}_last10pct_change"] = (
-                    float((after - before) / before) if before else None
-                )
+        if name == "lr":
+            result[name] = float(column[-1])
+            continue
+        result[name] = float(np.median(column[-window:]))
+        if n >= 2 * window:
+            before = float(np.median(column[-2 * window : -window]))
+            # Change of the median over the last fifth of training against the
+            # fifth before; clearly negative = still falling when it stopped.
+            result[f"{name}_tail_change"] = (
+                (result[name] - before) / before if before else None
+            )
     return result
+
+
+def count_starts(path):
+    """Training runs in one lcurve.out: each start writes a block of # lines."""
+    starts, previous = 0, False
+    try:
+        for line in Path(path).read_text().splitlines():
+            header = line.startswith("#")
+            starts += header and not previous
+            previous = header
+    except OSError:
+        pass
+    return starts
+
+
+def smooth(values, width):
+    """Rolling median, same length as the input."""
+    values = np.asarray(values, dtype=float)
+    half = max(1, width) // 2
+    return np.array(
+        [np.median(values[max(0, i - half) : i + half + 1]) for i in range(len(values))]
+    )
 
 
 def collect_training(root, iters):
@@ -428,6 +454,7 @@ def collect_training(root, iters):
                     "valid_frames": data_frames(
                         task, training.get("validation_data", {}), cache
                     ),
+                    "starts": count_starts(task / "lcurve.out"),
                     **lcurve_metrics(names, data),
                 }
             )
@@ -445,21 +472,48 @@ def train_findings(rows):
         models = by_iter[it]
         key = "rmse_f_val" if "rmse_f_val" in models[0] else "rmse_f_trn"
         values = [m[key] for m in models if m.get(key) is not None]
-        changes = [m.get(f"{key}_last10pct_change") for m in models]
+        if not values:
+            continue
+        changes = [m.get(f"{key}_tail_change") for m in models]
         changes = [c for c in changes if c is not None]
         line = (
             f"train: iter {it}: {key} {min(values):.4g}-{max(values):.4g} eV/A over {len(values)} models, "
             f"{models[0].get('train_frames', 0)} training frames, numb_steps {models[0].get('numb_steps')}"
         )
-        if changes and np.median(changes) < -0.03:
-            line += f"; still falling {-100 * float(np.median(changes)):.1f}% over the last tenth -> more steps should help"
+        if changes:
+            change = float(np.median(changes))
+            if change < -0.05:
+                line += f"; still falling {-100 * change:.0f}% over the last fifth -> more steps should help"
+            elif abs(change) <= 0.05:
+                line += "; flat over the last fifth -> more steps alone will not help"
         notes.append(line)
+        starts = max(m.get("starts", 1) for m in models)
+        if starts > 1:
+            notes.append(
+                f"train: iter {it}: training was started {starts} times (restarts after lost nodes)"
+            )
+        # A model far off the others inflates the committee deviation everywhere.
+        for name, unit in ((key, "eV/A"), (key.replace("_f_", "_e_"), "eV")):
+            finals = {m["model"]: m.get(name) for m in models if m.get(name)}
+            for model, value in finals.items():
+                others = [v for k, v in finals.items() if k != model]
+                if len(others) >= 2 and value > 2 * np.median(others):
+                    notes.append(
+                        f"train: iter {it}: model {model} {name} {value:.3g} {unit} is "
+                        f"{value / np.median(others):.1f}x the other models' median; "
+                        "it will inflate model deviation for every frame"
+                    )
         trn = [m.get("rmse_f_trn") for m in models if m.get("rmse_f_trn")]
         val = [m.get("rmse_f_val") for m in models if m.get("rmse_f_val")]
         if trn and val and np.median(val) > 1.5 * np.median(trn):
             notes.append(
                 f"train: iter {it}: validation force RMSE is {np.median(val) / np.median(trn):.1f}x training; "
                 "the models fit the training frames much better than unseen ones"
+            )
+        elif trn and not val:
+            notes.append(
+                f"train: iter {it}: no validation_data in input.json, so only training error is known; "
+                "use `dp test` on the 02.fp/validation.* frames for held-out error"
             )
     iters = sorted(by_iter)
     if len(iters) >= 2:
@@ -841,7 +895,8 @@ def plot_train(plt, rows, curves, out):
             x = [it for it, s in zip(iters, series) if s]
             if not x:
                 continue
-            mean = [float(np.mean(s)) for s in series if s]
+            # Median: one bad model should show as a wide band, not move the line.
+            mean = [float(np.median(s)) for s in series if s]
             ax.fill_between(
                 x,
                 [min(s) for s in series if s],
@@ -870,26 +925,45 @@ def plot_train(plt, rows, curves, out):
     plt.close(fig)
 
     latest = iters[-1]
-    fig, ax = plt.subplots(figsize=(6, 3.6))
-    for i, ((it, model), (names, data)) in enumerate(
-        sorted(k for k in curves.items() if k[0][0] == latest)
-    ):
-        table = np.asarray(data)
-        key = "rmse_f_val" if "rmse_f_val" in names else "rmse_f_trn"
-        ax.plot(
-            table[:, 0],
-            table[:, names.index(key)],
-            color=SERIES[i % len(SERIES)],
-            linewidth=1.2,
-            label=f"model {model}",
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+    for ax, quantity, unit in ((axes[0], "f", "eV/Å"), (axes[1], "e", "eV")):
+        for i, ((it, model), (names, data)) in enumerate(
+            sorted(k for k in curves.items() if k[0][0] == latest)
+        ):
+            key = next(
+                (
+                    k
+                    for k in (f"rmse_{quantity}_val", f"rmse_{quantity}_trn")
+                    if k in names
+                ),
+                None,
+            )
+            if key is None:
+                continue
+            table = np.asarray(data)
+            color = SERIES[i % len(SERIES)]
+            # Raw rows are single batches: show them faintly, read the median.
+            ax.plot(
+                table[:, 0],
+                table[:, names.index(key)],
+                color=color,
+                linewidth=0.6,
+                alpha=0.25,
+            )
+            ax.plot(
+                table[:, 0],
+                smooth(table[:, names.index(key)], max(5, len(table) // 10)),
+                color=color,
+                linewidth=2,
+                label=f"model {model}",
+            )
+        ax.set_yscale("log")
+        ax.set(
+            title=f"Iter {latest}: {'force' if quantity == 'f' else 'energy'} RMSE (rolling median)",
+            xlabel="step",
+            ylabel=f"RMSE ({unit})",
         )
-    ax.set_yscale("log")
-    ax.set(
-        title=f"Iter {latest}: force RMSE during training",
-        xlabel="step",
-        ylabel="RMSE (eV/Å)",
-    )
-    ax.legend(loc="upper right")
+        ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(out / "train_lcurve.png")
     plt.close(fig)
