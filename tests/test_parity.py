@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import dpdata
 import numpy as np
@@ -155,6 +156,7 @@ class TestParity(unittest.TestCase):
             machine=None,
             dp_command=self.command,
             d3_command=None,
+            allow_cpu=True,
         )
         vars(args).update(extra)
         return analyze.analyze(args)
@@ -221,6 +223,48 @@ class TestParity(unittest.TestCase):
                     original["energies"][index] - energy,
                     5,
                 )
+
+    def test_refuses_to_run_without_a_gpu(self):
+        with self.assertRaises(SystemExit) as raised:
+            with mock.patch.object(
+                parity, "check_gpu", return_value=(["PyTorch sees no CUDA GPU"], "")
+            ):
+                self.analyze(allow_cpu=False)
+        self.assertIn("would not run on a GPU", str(raised.exception))
+        self.assertIn("--allow-cpu", str(raised.exception))
+        self.assertEqual(self.calls(), [])
+        with mock.patch.object(
+            parity, "check_gpu", return_value=([], "1 CUDA GPU(s) visible")
+        ):
+            self.analyze(allow_cpu=False)
+        self.assertTrue(self.calls())
+
+    def test_gpu_probe(self):
+        def probe(count):
+            def runner(command, **kwargs):
+                self.assertEqual(command[0], sys.executable)
+                return mock.Mock(stdout=f"{count}\n")
+
+            return runner
+
+        command = f"{sys.executable} -m deepmd"
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}):
+            self.assertEqual(parity.check_gpu(command, probe(1))[0], [])
+            problems, _ = parity.check_gpu(command, probe(0))
+            self.assertIn("sees no CUDA GPU", problems[0])
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "-1"}):
+            self.assertIn("hides every GPU", parity.check_gpu(command, probe(1))[0][0])
+        with mock.patch.dict(os.environ, {"DEVICE": "cpu"}):
+            self.assertTrue(
+                any("DEVICE=cpu" in p for p in parity.check_gpu(command, probe(1))[0])
+            )
+        # A dp console script: the interpreter comes from its shebang.
+        script = self.root / "bin" / "dp"
+        script.parent.mkdir()
+        script.write_text(f"#!{sys.executable}\nprint()\n")
+        script.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(script.parent)}):
+            self.assertEqual(parity._dp_python("dp --pt-expt"), sys.executable)
 
     def test_no_holdout_explains_how_to_get_one(self):
         for path in self.root.glob("iter.*/02.fp"):

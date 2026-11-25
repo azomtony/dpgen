@@ -21,6 +21,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -113,8 +114,15 @@ def build_testset(root, out, jdata, d3_command="lmp", d3_runner=None):
             return manifest, entries
     if testset.exists():
         shutil.rmtree(testset)
-    for (system, formula, labeled), (_, _, path) in zip(ordered, entries):
+    for number, ((system, formula, labeled), (_, _, path)) in enumerate(
+        zip(ordered, entries), 1
+    ):
         if params is not None:
+            print(
+                f"[{number}/{len(ordered)}] removing D3 from test set "
+                f"sys.{system:03d}/{formula} ({len(labeled)} frames)",
+                flush=True,
+            )
             labeled = labeled.copy()
             energies, forces, virials = d3.compute_d3(
                 labeled, params, d3_command, d3_runner or d3._run_lammps
@@ -191,9 +199,90 @@ def make_cases(root, iterations, choice, entries, runs):
     return cases, skipped
 
 
-def run_dp_test(cases, runs, digest, dp_command=None, machine=None):
+def _dp_python(command):
+    """The Python interpreter behind a ``dp`` command, from its shebang."""
+    words = shlex.split(command)
+    if not words:
+        return None
+    if "python" in Path(words[0]).name:
+        return words[0]
+    path = shutil.which(words[0])
+    if path is None:
+        return None
+    try:
+        first = Path(path).read_bytes()[:512].split(b"\n", 1)[0].decode()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not first.startswith("#!") or "python" not in first:
+        return None
+    parts = first[2:].split()
+    return parts[1] if Path(parts[0]).name == "env" and len(parts) > 1 else parts[0]
+
+
+def check_gpu(command, runner=subprocess.run):
+    """Return (problems, description) for running ``command`` on a GPU here."""
+    problems = []
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and visible.strip() in ("", "-1"):
+        problems.append(f"CUDA_VISIBLE_DEVICES={visible!r} hides every GPU")
+    if os.environ.get("DEVICE", "").lower() == "cpu":
+        problems.append("DEVICE=cpu tells DeePMD to run on the CPU")
+    python = _dp_python(command)
+    if python is not None:
+        try:
+            probe = runner(
+                [python, "-c", "import torch; print(torch.cuda.device_count())"],
+                capture_output=True,
+                text=True,
+            )
+            count = int(probe.stdout.strip().splitlines()[-1])
+        except (OSError, ValueError, IndexError):
+            count = 0
+        if count == 0:
+            problems.append(f"PyTorch in {python} sees no CUDA GPU")
+        return problems, f"{count} CUDA GPU(s) visible to {python}"
+    try:
+        listed = runner(["nvidia-smi", "-L"], capture_output=True, text=True)
+        gpus = [line for line in listed.stdout.splitlines() if line.startswith("GPU")]
+    except OSError:
+        gpus = []
+    if not gpus:
+        problems.append("nvidia-smi finds no GPU on this node")
+    return problems, f"{len(gpus)} GPU(s) on this node (nvidia-smi)"
+
+
+def check_machine_gpu(machine):
+    from dpgen.tools.test_model import _get_task_mdata
+
+    _, _, _, resources, _ = _get_task_mdata(machine, "train")
+    if not int(resources.get("gpu_per_node", 0) or 0):
+        return [f"the train section of {machine} requests no GPU (gpu_per_node)"]
+    return []
+
+
+def run_dp_test(cases, runs, digest, dp_command=None, machine=None, allow_cpu=False):
     """Run ``dp test`` for every case not already done for this test set."""
     todo = [case for case in cases if not _done(case, digest)]
+    reused = len(cases) - len(todo)
+    print(
+        f"parity: {len(todo)} dp test run(s) to do"
+        + (f", {reused} reused from earlier runs" if reused else ""),
+        flush=True,
+    )
+    if todo and not allow_cpu:
+        if machine is not None:
+            problems, where = check_machine_gpu(machine), "the submitted job"
+        else:
+            command = dp_command or SUFFIX_COMMANDS[todo[0]["model"].suffix]
+            problems, where = check_gpu(command)
+        if problems:
+            raise SystemExit(
+                "parity: dp test would not run on a GPU:\n"
+                + "\n".join(f"  - {problem}" for problem in problems)
+                + "\nRun on a GPU node with the DeePMD environment active, use "
+                "--machine with a GPU train section, or pass --allow-cpu."
+            )
+        print(f"parity: dp test on GPU ({where})", flush=True)
     if todo and machine is not None:
         from dpgen.tools.test_model import submit_model_tests
 
@@ -201,7 +290,15 @@ def run_dp_test(cases, runs, digest, dp_command=None, machine=None):
             todo, runs, machine, "train", dp_command=dp_command, keep_going=True
         )
     elif todo:
-        for case in todo:
+        width = len(str(len(todo)))
+        for number, case in enumerate(todo, 1):
+            print(
+                f"[{number:{width}d}/{len(todo)}] iter {case['iteration']} "
+                f"{case['model'].stem} {case['system_name']}",
+                end="",
+                flush=True,
+            )
+            start = time.monotonic()
             case["run_dir"].mkdir(parents=True, exist_ok=True)
             command = dp_command or SUFFIX_COMMANDS[case["model"].suffix]
             result = subprocess.run(
@@ -222,6 +319,8 @@ def run_dp_test(cases, runs, digest, dp_command=None, machine=None):
                 stderr=subprocess.STDOUT,
             )
             (case["run_dir"] / "dp_test.log").write_text(result.stdout)
+            status = "done" if result.returncode == 0 else "FAILED"
+            print(f"  {status} ({time.monotonic() - start:.0f} s)", flush=True)
     failed = []
     for case in todo:
         if all((case["run_dir"] / name).exists() for name in DETAIL_FILES):
@@ -454,6 +553,7 @@ def run(
     plt=None,
     style=None,
     d3_runner=None,
+    allow_cpu=False,
 ):
     """Build the test set, test the selected iterations, write the report.
 
@@ -477,7 +577,9 @@ def run(
     ]
     if not cases:
         return notes + ["parity: no iteration with trained models selected"], []
-    failed = run_dp_test(cases, runs, manifest["digest"], dp_command, machine)
+    failed = run_dp_test(
+        cases, runs, manifest["digest"], dp_command, machine, allow_cpu
+    )
     notes += [
         f"parity: dp test failed for {case['run_task']}; see "
         f"{case['run_dir'] / 'dp_test.log'}"

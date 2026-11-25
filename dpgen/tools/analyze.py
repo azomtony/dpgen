@@ -1042,6 +1042,7 @@ def analyze(args):
             d3_command=parity.d3_command_from(machine, args.d3_command),
             plt=plt,
             style=(SERIES, INK, MUTED),
+            allow_cpu=getattr(args, "allow_cpu", False),
         )
 
     if "devi" in parts:
@@ -1146,6 +1147,11 @@ def add_parser(subparsers):
         "--dp-command",
         help="parity: DeePMD command, e.g. 'dp --pt-expt' (default: from the model "
         "suffix, or the machine train command)",
+    )
+    parity.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="parity: run dp test even when no GPU is available (slow)",
     )
     parity.add_argument(
         "--d3-command",
