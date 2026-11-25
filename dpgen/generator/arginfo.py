@@ -151,6 +151,37 @@ def training_args_dp() -> list[Argument]:
             doc="Seed for the persistent validation split shared by all models. Keep unchanged across iterations.",
         ),
         Argument(
+            "training_strip_d3",
+            dict,
+            optional=True,
+            doc=(
+                "Subtract the D3 dispersion term from energies, forces and virials before training, "
+                "for labels computed with D3 (e.g. VASP IVDW=12). D3 is computed with LAMMPS "
+                "pair_style dispersion/d3 (machine.json `d3_command`, default `lmp`). Labels on disk "
+                "are unchanged; stripped copies are cached in ./.dpgen-d3. If lmp_d3 is enabled, "
+                "its settings must match."
+            ),
+            sub_fields=[
+                Argument("enable", bool, optional=True, default=True),
+                Argument(
+                    "damping_function",
+                    str,
+                    optional=False,
+                    doc="D3 damping: 'original' (zero), 'zerom', 'bj' or 'bjm'. VASP IVDW=12 is 'bj'.",
+                ),
+                Argument(
+                    "functional", str, optional=False, doc="Functional, e.g. 'pbe'."
+                ),
+                Argument("cutoff", [float, int], optional=False, doc="D3 cutoff in Å."),
+                Argument(
+                    "cn_cutoff",
+                    [float, int],
+                    optional=False,
+                    doc="Coordination-number cutoff in Å.",
+                ),
+            ],
+        ),
+        Argument(
             "train_backend",
             str,
             optional=True,
@@ -354,6 +385,20 @@ def model_devi_jobs_args() -> list[Argument]:
             optional=True,
             default=2.0,
             doc="Stop plasma exploration at this multiple of an upper trust limit.",
+        ),
+        Argument(
+            "aggregation_bias",
+            dict,
+            optional=True,
+            doc=(
+                "Pull two molecular cores (e.g. asphaltene aromatic cores) together with a "
+                "Colvars distance restraint, keeping the pair at the box center with fix "
+                "recenter. Keys: cores ('auto', [[...], [...]] 0-based POSCAR indices, or a "
+                "dict of such pairs keyed by system index), target (Å, 3.5), k (eV/Å^2, 1.0), "
+                "pull_steps (default nsteps/2; held at target afterwards), recenter (true), "
+                "upper_wall (Å, optional), min_core_atoms (10), bond_scale (1.2). "
+                "Native LAMMPS exploration only; LAMMPS needs the COLVARS package."
+            ),
         ),
         Argument("neidelay", int, optional=True, doc=doc_neidelay),
         Argument("taut", float, optional=True, doc=doc_taut),
@@ -1146,6 +1191,25 @@ def fp_args() -> list[Argument]:
         ),
         Argument("ratio_failed", float, optional=True, doc=doc_ratio_failed),
         Argument("failed_ratio", float, optional=True, doc=doc_failed_ratio),
+        Argument(
+            "fp_holdout_fraction",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc=(
+                "Probability (0 to 0.5) that each new FP single point is kept out of "
+                "training and written to 02.fp/validation.SSS as test data. Each system "
+                "keeps at least one new label for training. VASP only; plasma jobs use "
+                "their own selection. Used by `dpgen analyze parity`."
+            ),
+        ),
+        Argument(
+            "fp_holdout_seed",
+            int,
+            optional=True,
+            default=42,
+            doc="Seed for fp_holdout_fraction; draws differ per iteration and system.",
+        ),
         Argument(
             "job_recovery",
             dict,

@@ -167,6 +167,104 @@ full-model fine-tuning; LoRA and spin workflows have not been validated.
 
 See `examples/run/dpa4-finetune/README.md` for a configuration recipe.
 
+## Training without D3, exploring with D3
+
+When the DFT labels include Grimme D3 (for example VASP `IVDW=12`, D3 with
+Becke–Johnson damping), the model can learn only the DFT part. Exploration then
+adds D3 back through LAMMPS. The two options are independent, and both are off
+by default:
+
+```json
+"training_strip_d3": {
+  "damping_function": "bj",
+  "functional": "pbe",
+  "cutoff": 50.2,
+  "cn_cutoff": 20.0
+},
+"lmp_d3": {
+  "enable": true,
+  "damping_function": "bj",
+  "functional": "pbe",
+  "cutoff": 50.2,
+  "cn_cutoff": 20.0
+}
+```
+
+`training_strip_d3` works with `dpgen run` and `dpgen finetune`. At every
+`make_train`:
+
+1. Each training system (initial data and every iteration's labels) is run once
+   through LAMMPS `pair_style dispersion/d3`, frame by frame.
+2. The D3 energy, forces and virial are subtracted.
+3. The result is cached in `./.dpgen-d3`. The cache is rebuilt only when the
+   labels or the D3 settings change.
+
+Training reads the copies from `00.train/data.nod3`. The labels on disk keep
+the D3 term. Explicit `validation_data` systems are stripped too, and
+`validation_fraction` splits the stripped data. Every system needs element
+names, from `type_map.raw`.
+
+D3 is computed by the `d3_command` in machine.json (default `lmp`), run where
+`dpgen` runs. That LAMMPS must include `dispersion/d3` (check with
+`lmp -h | grep dispersion`). It can be an MPI launcher, for example
+`"d3_command": "mpirun -np 8 lmp"`.
+
+If both blocks are enabled, their settings must match. Otherwise the model
+would see D3 counted twice or missing, so dpgen stops with an error. Match the
+DFT settings too:
+
+- VASP `IVDW=12` is `"bj"`, and `IVDW=11` is `"original"` (zero damping).
+- `cutoff` and `cn_cutoff` correspond to `VDW_RADIUS` and `VDW_CNRADIUS`
+  (VASP defaults: 50.2 and 20 Å).
+- LAMMPS `dispersion/d3` has no three-body term, which matches VASP's default.
+
+Model deviation in `model_devi.out` comes only from the deepmd models, so trust
+levels are not affected by D3. Labels in `02.fp/validation.*` still include D3;
+`dpgen analyze parity` strips them before comparing.
+
+## Held-out FP test set and parity plots
+
+To keep part of each iteration's single points out of training as test data,
+set:
+
+```json
+"fp_holdout_fraction": 0.1,
+"fp_holdout_seed": 42
+```
+
+How tasks are held out:
+
+- Each new FP task is held out with that probability (at most 0.5). The draw is
+  seeded per iteration and per system.
+- Each system keeps at least one new label for training.
+- Held-out tasks carry an `fp-holdout` marker file. `post_fp` writes their
+  labels to `02.fp/validation.SSS` instead of `data.SSS`, so no model ever
+  trains on them.
+- This is VASP only. Plasma jobs keep their own holdout.
+
+`dpgen analyze parity` merges the held-out labels from all iterations into one
+fixed test set. It then tests the models of the selected iterations against it:
+
+```bash
+dpgen analyze parity -i 5                  # one iteration
+dpgen analyze parity -i 2-6                # one row of plots per iteration
+dpgen analyze parity -i 2-6 --model mean   # committee-mean prediction
+dpgen analyze parity -i 2-6 --machine machine.json   # run dp test as a job
+```
+
+The output goes to `analysis/`:
+
+- `parity.png`: one row per iteration. Each row has energy per atom and force
+  components, model against DFT. All systems are in each panel, colored by
+  `sys_configs` entry, with RMSE, MAE and frame count in each panel.
+- `parity_summary.csv`: RMSE and MAE per iteration, overall and per system.
+
+`--model` selects a model index (default 0) or `mean`. `dp test` results are
+reused until the test set or the model changes, so adding iterations to the
+range only tests the new ones. With `training_strip_d3`, the test set is
+stripped of D3 the same way, so models are compared with matching labels. The
+D3 command comes from `--d3-command`, or the machine file's `d3_command`.
+
 
 ### Continue exploration from a previous trajectory
 
@@ -208,6 +306,67 @@ applies when exploration tasks are created; it does not rewind already completed
 tasks. It defaults to `false`, preserving the original starting-structure and
 cleanup behavior. Template inputs, PIMD, and cluster selection are not supported
 with this option.
+
+### Pulling two molecules together (aggregation bias)
+
+To sample how two molecules aggregate, for example two asphaltenes whose
+aromatic cores stack, add `aggregation_bias` to a `model_devi_jobs` entry.
+LAMMPS needs the COLVARS package.
+
+```json
+{
+  "sys_idx": [0],
+  "ensemble": "nvt",
+  "temps": [300],
+  "nsteps": 200000,
+  "trj_freq": 100,
+  "aggregation_bias": {
+    "cores": "auto",
+    "target": 3.5,
+    "k": 1.0,
+    "pull_steps": 100000,
+    "recenter": true
+  }
+}
+```
+
+Each exploration task then:
+
+- **Pulls the cores together.** The Colvars `distance` between the centers of
+  mass of the two cores is pulled by a moving harmonic restraint, from its
+  starting value to `target` (Å) over `pull_steps`. After that it is held at
+  `target`.
+  - `k` is in eV/Å².
+  - `pull_steps` defaults to half of `nsteps`.
+  - `upper_wall` (Å) adds a wall that stops the cores drifting back apart.
+- **Keeps the pair centered** (`recenter`, on by default). `fix recenter`
+  translates the whole system every step so the pair's center sits at the box
+  center. It adds no force and keeps the pair away from the periodic
+  boundaries.
+- **Leaves orientation free.** The cores can approach face-to-face, tilted or
+  edge-on.
+
+Selecting the cores:
+
+- `"cores": "auto"` finds molecules from covalent bonds, then the largest fused
+  system of sp2 ring atoms in each one. Molecules whose core has at least
+  `min_core_atoms` atoms (default 10) count. This excludes benzene and toluene
+  solvent rings, which have 6. Exactly two must be found.
+- Explicit cores are two lists of 0-based atom indices in POSCAR order:
+  `[[...], [...]]`. Use a dict keyed by system index to give each system its
+  own pair. Explicit indices cannot be combined with `shuffle_poscar`.
+
+Each task writes its own `conf.lmp` with image flags, so both cores are whole
+and the second core is the periodic image nearest the first. The cores must
+start less than half the box width apart, otherwise the pull could follow a
+periodic image; dpgen stops with an error in that case. The pulling state is
+kept in LAMMPS restart files, so a resumed task continues the pull.
+
+`job.json` records the cores (with element counts) and the starting distance.
+`colvars.colvars.traj`, written every `trj_freq` steps, lists the core distance
+for each dumped frame. Frames are still selected by model deviation; the bias
+only steers where the trajectory goes. The bias works only with native
+classical LAMMPS jobs (no templates, plasma, PIMD or `model_devi_nopbc`).
 
 ### Plasma deposition exploration
 

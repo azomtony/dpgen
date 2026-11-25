@@ -532,6 +532,9 @@ def _run_train_pytorch_with_init(iter_index, jdata, mdata, init_from_foundation)
         trans_comm_data = ["data.hdf5"]
     if jdata.get("validation_fraction", 0):
         trans_comm_data.append("data.validation")
+    # Still inside work_path here when one_h5 is off.
+    if not jdata.get("one_h5", False) and os.path.isdir("data.nod3"):
+        trans_comm_data.append("data.nod3")
     trans_comm_data = list(set(trans_comm_data))
     os.chdir(cwd)
 

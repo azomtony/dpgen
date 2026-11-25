@@ -204,6 +204,39 @@ class TestMakeLammpsInput(unittest.TestCase):
         self.assertIn("atom_modify     map yes", result)
         self.assertIn("pair_coeff      * * O H", result)
 
+    def test_dpa4c_with_d3_maps_elements_on_both_styles(self):
+        jdata = {
+            "finetune_model_type": "dpa4c",
+            "type_map": ["O", "H"],
+            "lmp_d3": {
+                "enable": True,
+                "damping_function": "bj",
+                "functional": "pbe",
+                "cutoff": 50.0,
+                "cn_cutoff": 20.0,
+            },
+        }
+        result = make_lammps_input(
+            self.ensemble,
+            self.conf_file,
+            ["compressed_model.pt2"],
+            self.nsteps,
+            self.dt,
+            self.neidelay,
+            self.trj_freq,
+            self.mass_map,
+            self.temp,
+            jdata,
+            pres=1.0,
+            deepmd_version="3.2",
+        )
+        self.assertIn(
+            "pair_style      hybrid/overlay deepmd compressed_model.pt2", result
+        )
+        self.assertIn("dispersion/d3 bj pbe 50.0 20.0", result)
+        self.assertIn("pair_coeff      * * deepmd O H\n", result)
+        self.assertIn("pair_coeff      * * dispersion/d3 O H\n", result)
+
     def test_d3_with_neigh_modify_one(self):
         """Test D3 with lmp_neigh_modify_one parameter."""
         jdata = {

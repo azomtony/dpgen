@@ -719,8 +719,11 @@ def make_train_dp(iter_index, jdata, mdata, force_train=False):
             )
     # Copy user defined forward files
     symlink_user_forward_files(mdata=mdata, task_type="train", work_path=work_path)
+    from dpgen.generator.lib.d3 import make_d3_stripped
     from dpgen.generator.lib.validation import make_validation_split
 
+    # Strip first, so the validation split holds out stripped frames too.
+    make_d3_stripped(input_files, work_path, jdata, mdata)
     make_validation_split(input_files, work_path, jdata)
     # HDF5 format for training data
     if jdata.get("one_h5", False):
@@ -976,6 +979,9 @@ def run_train_dp(iter_index, jdata, mdata):
         trans_comm_data = ["data.hdf5"]
     if jdata.get("validation_fraction", 0):
         trans_comm_data.append("data.validation")
+    # Still inside work_path here when one_h5 is off.
+    if not jdata.get("one_h5", False) and os.path.isdir("data.nod3"):
+        trans_comm_data.append("data.nod3")
     # remove duplicated files
     trans_comm_data = list(set(trans_comm_data))
     os.chdir(cwd)
@@ -1246,6 +1252,12 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
 
     type_map = jdata.get("type_map", [])
     type_map_str = " ".join(type_map)
+    # Compiled .pt2 models map LAMMPS types to elements, as without D3.
+    deepmd_coeff = (
+        f"pair_coeff      * * deepmd {type_map_str}\n"
+        if pt2_enabled
+        else "pair_coeff      * * deepmd\n"
+    )
 
     # Find pair_coeff line
     pair_coeff_idx = None
@@ -1258,7 +1270,7 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
         # If no pair_coeff found, add them after pair_style
         pair_style_idx = find_only_one_key(lmp_lines, ["pair_style"])
         if d3_enabled:
-            lmp_lines.insert(pair_style_idx + 1, "pair_coeff      * * deepmd\n")
+            lmp_lines.insert(pair_style_idx + 1, deepmd_coeff)
             lmp_lines.insert(
                 pair_style_idx + 2,
                 f"pair_coeff      * * dispersion/d3 {type_map_str}\n",
@@ -1270,7 +1282,7 @@ def revise_lmp_input_pair_coeff(lmp_lines, jdata=None):
     else:
         if d3_enabled:
             # Replace existing pair_coeff with D3 version
-            lmp_lines[pair_coeff_idx] = "pair_coeff      * * deepmd\n"
+            lmp_lines[pair_coeff_idx] = deepmd_coeff
             lmp_lines.insert(
                 pair_coeff_idx + 1,
                 f"pair_coeff      * * dispersion/d3 {type_map_str}\n",
@@ -1835,6 +1847,11 @@ def _make_model_devi_native(iter_index, jdata, mdata, conf_systems):
         return False
     cur_job = model_devi_jobs[iter_index]
     ensemble, nsteps, trj_freq, temps, press, pka_e, dt, nbeads = parse_cur_job(cur_job)
+    from dpgen.generator.lib import aggregation
+
+    aggregation_bias = aggregation.options(cur_job, nsteps)
+    if aggregation_bias is not None:
+        aggregation.check_compatible(jdata, cur_job)
     model_devi_f_avg_relative = jdata.get("model_devi_f_avg_relative", False)
     model_devi_merge_traj = jdata.get("model_devi_merge_traj", False)
     if (nbeads is not None) and model_devi_f_avg_relative:
@@ -1977,6 +1994,15 @@ def _make_model_devi_native(iter_index, jdata, mdata, conf_systems):
                         deepmd_version=deepmd_version,
                         nbeads=nbeads,
                     )
+                    if aggregation_bias is not None:
+                        file_c, job["aggregation_bias"] = aggregation.apply(
+                            file_c,
+                            loc_conf_name,
+                            aggregation_bias,
+                            jdata,
+                            sys_idx[sys_counter],
+                            trj_freq,
+                        )
                     job["model_devi_dt"] = model_devi_dt
                     with open("job.json", "w") as _outfile:
                         json.dump(job, _outfile, indent=4)
@@ -2382,6 +2408,11 @@ def run_md_model_devi(iter_index, jdata, mdata):
             backward_files += ["output.plumed", "COLVAR"]
             if use_plm_path:
                 forward_files += ["plmpath.pdb"]
+        if cur_job.get("aggregation_bias") is not None:
+            from dpgen.generator.lib.aggregation import COLVARS_INPUT, COLVARS_TRAJ
+
+            forward_files += [COLVARS_INPUT]
+            backward_files += [COLVARS_TRAJ]
     elif model_devi_engine == "gromacs":
         gromacs_settings = jdata.get("gromacs_settings", {})
         mdp_filename = gromacs_settings.get("mdp_filename", "md.mdp")
@@ -4412,6 +4443,9 @@ def make_fp(iter_index, jdata, mdata):
     fp_tasks = _make_fp_vasp_configs(iter_index, jdata)
     if len(fp_tasks) == 0:
         return
+    from dpgen.generator.lib.holdout import mark_fp_holdout
+
+    mark_fp_holdout(fp_tasks, iter_index, jdata)
     make_fp_calculation(iter_index, jdata, mdata)
 
 
@@ -4915,6 +4949,10 @@ def post_fp_vasp(iter_index, jdata, rfailed=None):
                             )
                         # check if ele_temp shape is correct
                         _sys.check_data()
+                if not holdout:
+                    from dpgen.generator.lib.holdout import is_held_out
+
+                    holdout = is_held_out(os.path.dirname(oo))
                 if holdout:
                     if validation_sys is None:
                         validation_sys = dpdata.MultiSystems(

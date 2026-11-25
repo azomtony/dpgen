@@ -158,7 +158,9 @@ def make_lammps_input(
         # D3 requires type maps (element symbols)
         type_map = jdata.get("type_map", [])
         type_map_str = " ".join(type_map)
-        ret += "pair_coeff      * * deepmd\n"
+        # Compiled .pt2 models map LAMMPS types to elements, as without D3.
+        deepmd_elements = f" {type_map_str}" if uses_pt2(jdata) else ""
+        ret += f"pair_coeff      * * deepmd{deepmd_elements}\n"
         ret += f"pair_coeff      * * dispersion/d3 {type_map_str}\n"
     elif uses_pt2(jdata):
         type_map = jdata.get("type_map", [])

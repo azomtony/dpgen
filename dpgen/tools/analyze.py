@@ -17,6 +17,12 @@ fp
     What happened to the frames sent to FP: labelled, stopped by the monitor,
     failed or discarded, and whether the lost ones were the high-deviation
     frames the models most needed.
+parity
+    Merges every iteration's held-out FP labels (``fp_holdout_fraction``)
+    into one test set, runs ``dp test`` with the models of each selected
+    iteration (``-i``), and plots model against DFT for energy per atom and
+    force, one row per iteration, with RMSE in each panel. Not part of
+    ``all``, because it runs ``dp test``; use ``--machine`` to run it as a job.
 """
 
 import argparse
@@ -1017,6 +1023,27 @@ def analyze(args):
     notes = []
     written = []
 
+    if "parity" in parts:
+        from dpgen.tools import parity
+
+        machine = None
+        if args.machine:
+            machine = str(
+                args.machine if Path(args.machine).exists() else root / args.machine
+            )
+        notes, written = parity.run(
+            root,
+            jdata,
+            out,
+            iters,
+            choice=args.model,
+            machine=machine,
+            dp_command=args.dp_command,
+            d3_command=parity.d3_command_from(machine, args.d3_command),
+            plt=plt,
+            style=(SERIES, INK, MUTED),
+        )
+
     if "devi" in parts:
         frames = collect_frames(root, jdata, iters)
         summary = summarize_frames(frames)
@@ -1077,7 +1104,11 @@ def add_parser(subparsers):
         description=__doc__.split("\n\n", 1)[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("PART", choices=(*PARTS, "all"), help="what to analyze")
+    parser.add_argument(
+        "PART",
+        choices=(*PARTS, "parity", "all"),
+        help="what to analyze; parity runs dp test and is not part of all",
+    )
     parser.add_argument(
         "JOB_DIR", nargs="?", default=".", help="the DP-GEN job folder (default: .)"
     )
@@ -1099,6 +1130,27 @@ def add_parser(subparsers):
     )
     parser.add_argument(
         "--no-plots", action="store_true", help="write tables and summary only"
+    )
+    parity = parser.add_argument_group("parity")
+    parity.add_argument(
+        "--model",
+        default="0",
+        help='parity: model index to test (default 0), or "mean" for the committee mean',
+    )
+    parity.add_argument(
+        "--machine",
+        help="parity: machine.json whose train section runs dp test as a job; "
+        "without it dp test runs here",
+    )
+    parity.add_argument(
+        "--dp-command",
+        help="parity: DeePMD command, e.g. 'dp --pt-expt' (default: from the model "
+        "suffix, or the machine train command)",
+    )
+    parity.add_argument(
+        "--d3-command",
+        help="parity: LAMMPS for stripping D3 from the test set when "
+        "training_strip_d3 is set (default: machine d3_command, else lmp)",
     )
     parser.set_defaults(func=analyze)
     return parser
